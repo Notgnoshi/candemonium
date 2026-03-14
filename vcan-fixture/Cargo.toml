@@ -1,17 +1,16 @@
 [package]
-name = "candumpr"
+name = "vcan-fixture"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Log CAN traffic from multiple networks"
+description = "Build vcan interfaces in isolated network namespaces"
 
 [features]
 ci = []
 
 [dependencies]
-
-[dev-dependencies]
 ctor.workspace = true
+eyre.workspace = true
 libc.workspace = true
-vcan-fixture = { path = "../vcan-fixture" }
+neli.workspace = true

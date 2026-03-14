@@ -78,13 +78,27 @@ jobs:
                 components: llvm-tools-preview
             - name: Setup Rust cache
               uses: swatinem/rust-cache@v2
+            - name: Setup vcan
+              id: vcan
+              run: |
+                  # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor.
+                  # The vcan-fixture crate needs user namespaces to create isolated vcan
+                  # interfaces without root.
+                  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+                  sudo apt-get install -y linux-modules-extra-"$(uname -r)" && \
+                      sudo modprobe vcan && \
+                      echo "available=true" >> "$GITHUB_OUTPUT" || true
             - name: Setup nextest
               uses: taiki-e/install-action@v2
               with:
                 tool: cargo-nextest,cargo-llvm-cov
             - name: Test
+              run: cargo llvm-cov --no-report nextest --all-features --no-tests=warn
+            - name: Test (vcan)
+              if: steps.vcan.outputs.available == 'true'
+              run: cargo llvm-cov --no-report nextest --all-features --run-ignored ignored-only
+            - name: Coverage report
               run: |
-                  cargo llvm-cov --no-report nextest --all-features --no-tests=warn
                   cargo llvm-cov report --cobertura --output-path coverage.xml
                   head coverage.xml
                   RATE="$(grep -o -m 1 -P '(?<=line-rate=").*?(?=")' coverage.xml | head -1)"
@@ -111,3 +125,16 @@ jobs:
                 valColorRange: ${{ env.COVERAGE_PERCENT }}
                 minColorRange: 40
                 maxColorRange: 65
+
+    # Canary job: verifies vcan is available on the runner. Shows yellow when the
+    # linux-modules-extra package drifts from the runner kernel version, which means the socketcan
+    # tests in the test job are being silently skipped.
+    vcan-available:
+        runs-on: ubuntu-latest
+        continue-on-error: true
+        steps:
+            - name: Setup vcan
+              run: |
+                  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+                  sudo apt-get install -y linux-modules-extra-"$(uname -r)"
+                  sudo modprobe vcan

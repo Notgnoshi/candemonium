@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "candumpr",
     "cangenr",
+    "vcan-fixture",
 ]
 
 [workspace.package]
@@ -11,3 +12,9 @@ edition = "2024"
 license = "MIT"
 rust-version = "1.89"
 description = "Opinionated rewrites of can-utils in Rust"
+
+[workspace.dependencies]
+ctor = "0.6"
+eyre = "0.6"
+libc = "0.2"
+neli = "0.7"
