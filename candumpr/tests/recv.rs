@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use candumpr::can::{self, CanFrame};
 use candumpr::recv::dedicated::DedicatedRecv;
+use candumpr::recv::epoll::EpollRecv;
 use vcan_fixture::VcanHarness;
 
 #[ctor::ctor]
@@ -60,6 +61,29 @@ fn dedicated() {
     let total = backend
         .run(stop, &|_idx, _frame| {
             if count.fetch_add(1, Ordering::Relaxed) + 1 >= TOTAL_FRAMES {
+                stop2.store(true, Ordering::Relaxed);
+            }
+        })
+        .unwrap();
+
+    assert_eq!(total, TOTAL_FRAMES);
+}
+
+#[test]
+#[cfg_attr(feature = "ci", ignore = "requires vcan")]
+fn epoll() {
+    let vcans = VcanHarness::new(IFACE_COUNT).unwrap();
+    let rx = setup_rx_and_send(vcans.names(), false);
+    let mut backend = EpollRecv::new(rx).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let mut count = 0u64;
+
+    let total = backend
+        .run(stop, &mut |_idx, _frame| {
+            count += 1;
+            if count >= TOTAL_FRAMES {
                 stop2.store(true, Ordering::Relaxed);
             }
         })
