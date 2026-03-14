@@ -1,0 +1,49 @@
+name: Release
+
+# This workflow is not ordered after the 'Lint' workflow. And doing so is difficult, because
+# workflow_run: only applies on the default branch, and I EXPRESSLY WANT this workflow to run in PRs
+# too, because it validates some preconditions for making the release.
+#
+# So make the assumption that if the PR pipeline passed, and this workflow runs on the default
+# branch, it's okay to make a release without waiting for the build and test
+on: push
+
+jobs:
+    release:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Extract Release Metadata
+              shell: bash
+              run: |
+                VERSION="$(.github/parse-manifest-key.sh Cargo.toml version)"
+                DESCRIPTION="$(.github/parse-manifest-key.sh Cargo.toml description)"
+                echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+                echo "DESCRIPTION=$DESCRIPTION" >> "$GITHUB_ENV"
+
+            # Always generate release notes for the current version. If the version from the Cargo
+            # manifest isn't found in the CHANGELOG.md, then fail the pipeline (even in PRs)
+            - name: Generate Release Notes
+              shell: bash
+              run: .github/get-release-notes.sh "$VERSION" "$DESCRIPTION" | tee release.md
+
+            - name: Create Release
+              shell: bash
+              if: github.ref_name == github.event.repository.default_branch
+              env:
+                GH_TOKEN: ${{ secrets.CAN_UTILS_RS_RELEASE_TOKEN }}
+              run: |
+                if gh release view "v$VERSION" &>/dev/null; then
+                    echo "Release v$VERSION already exists. Skipping ..."
+                else
+                    echo "Creating release v$VERSION ..."
+                    PRERELEASE_FLAG=""
+                    if [[ "$VERSION" == *-rc* ]]; then
+                        PRERELEASE_FLAG="--prerelease"
+                    fi
+                    gh release create "v$VERSION" \
+                        --title "v$VERSION" \
+                        --notes-file release.md \
+                        $PRERELEASE_FLAG
+                fi

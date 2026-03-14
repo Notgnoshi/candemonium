@@ -1,0 +1,107 @@
+name: Lint
+on: push
+env:
+    RUSTFLAGS: -D warnings
+    CARGO_TERM_COLOR: always
+
+jobs:
+    gitlint:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                # PRs (hopefully??!) won't have more than 20 commits
+                fetch-depth: 20
+            - name: Install gitlint
+              run: python -m pip install gitlint
+            - name: Run gitlint
+              env:
+                # Don't use github.event.pull_request.base-sha, because that requires a workflow
+                # event of 'pull_request' which precludes running this workflow on 'main'.
+                GITLINT_COMMIT_RANGE: "origin/main..HEAD"
+              run: |
+                echo "GITLINT_COMMIT_RANGE=$GITLINT_COMMIT_RANGE"
+                git fetch origin main
+                git log --color=always --graph --decorate --oneline "$GITLINT_COMMIT_RANGE"
+                gitlint \
+                    --ignore-stdin \
+                    --config .github/gitlint/gitlint.ini \
+                    --extra-path .github/gitlint/ \
+                    --commits "$GITLINT_COMMIT_RANGE"
+
+    format:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - name: Setup Rust toolchain
+              uses: dtolnay/rust-toolchain@master
+              with:
+                toolchain: stable
+                components: rustfmt
+            - name: Run rustfmt
+              run: cargo fmt -- --check --config group_imports=StdExternalCrate,imports_granularity=Module
+
+    dprint:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - name: Setup dprint
+              uses: dprint/check@v2.2
+
+    build:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - name: Setup Rust toolchain
+              uses: dtolnay/rust-toolchain@master
+              with:
+                toolchain: stable
+                components: clippy
+            - name: Setup Rust cache
+              uses: swatinem/rust-cache@v2
+            - name: Build
+              run: cargo build --all-targets --all-features
+            - name: Clippy
+              run: cargo clippy --no-deps --all-targets --all-features
+
+    test:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - name: Setup Rust toolchain
+              uses: dtolnay/rust-toolchain@master
+              with:
+                toolchain: stable
+                components: llvm-tools-preview
+            - name: Setup Rust cache
+              uses: swatinem/rust-cache@v2
+            - name: Setup nextest
+              uses: taiki-e/install-action@v2
+              with:
+                tool: cargo-nextest,cargo-llvm-cov
+            - name: Test
+              run: |
+                  cargo llvm-cov --no-report nextest --all-features --no-tests=warn
+                  cargo llvm-cov report --cobertura --output-path coverage.xml
+                  head coverage.xml
+                  RATE="$(grep -o -m 1 -P '(?<=line-rate=").*?(?=")' coverage.xml | head -1)"
+                  echo "RATE=$RATE"
+                  PERCENT="$(echo "($RATE * 100)/1" | bc)"
+                  echo "PERCENT=$PERCENT"
+                  echo "COVERAGE_PERCENT=$PERCENT" >> $GITHUB_ENV
+            - name: Update coverage badge
+              uses: schneegans/dynamic-badges-action@v1.7.0
+              if: github.ref_name == github.event.repository.default_branch
+              with:
+                # https://github.com/Notgnoshi/can-utils-rs/settings/secrets/actions
+                # https://github.com/settings/personal-access-tokens
+                # https://gist.github.com/Notgnoshi/55f3f6cae2abdc5d011d907624dfb883
+                # https://github.com/marketplace/actions/dynamic-badges
+                auth: ${{ secrets.CAN_UTILS_RS_COVERAGE_GIST_TOKEN }}
+                gistID: 55f3f6cae2abdc5d011d907624dfb883
+                filename: can-utils-rs-coverage.json
+                label: Code Coverage
+                message: ${{ env.COVERAGE_PERCENT }}
+                valColorRange: ${{ env.COVERAGE_PERCENT }}
+                minColorRange: 40
+                maxColorRange: 65
