@@ -28,7 +28,7 @@
 //!
 //! The `vcan` kernel module must be loaded on the host before tests run.
 //!
-//! ## Fedora 24+
+//! ## Fedora 42+
 //!
 //! ```ignore
 //! sudo modprobe vcan
