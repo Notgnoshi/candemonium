@@ -87,6 +87,8 @@ fn open_can_socket(ifname: &str, flags: i32) -> std::io::Result<OwnedFd> {
 }
 
 /// Set the kernel receive buffer size for the socket.
+///
+/// The kernel clamps this to `net.core.rmem_max` and then doubles it internally.
 pub fn set_recv_buffer(fd: BorrowedFd<'_>, bytes: u32) -> std::io::Result<()> {
     let val = bytes as libc::c_int;
     let ret = unsafe {
