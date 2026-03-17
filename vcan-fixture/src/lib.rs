@@ -48,6 +48,7 @@
 //! In Ubuntu 25.10+ `linux-modules-extra` will get merged back into `linux-modules` and be
 //! available by default.
 
+pub mod bench;
 mod netlink;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
