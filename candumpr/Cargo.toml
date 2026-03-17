@@ -16,5 +16,11 @@ libc.workspace = true
 
 [dev-dependencies]
 ctor.workspace = true
+tabled.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
 vcan-fixture = { path = "../vcan-fixture" }
+
+[[bench]]
+name = "recv_impact"
+harness = false
