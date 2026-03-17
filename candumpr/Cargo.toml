@@ -24,3 +24,7 @@ vcan-fixture = { path = "../vcan-fixture" }
 [[bench]]
 name = "recv_impact"
 harness = false
+
+[[bench]]
+name = "recv_contention"
+harness = false
