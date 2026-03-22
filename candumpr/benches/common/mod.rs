@@ -200,7 +200,10 @@ pub struct RunResult {
 }
 
 pub fn print_results(results: &[RunResult]) {
-    let table = tabled::Table::new(results).to_string();
+    use tabled::settings::Style;
+    let table = tabled::Table::new(results)
+        .with(Style::markdown())
+        .to_string();
     eprintln!("{table}");
 }
 
