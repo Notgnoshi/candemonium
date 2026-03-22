@@ -40,8 +40,7 @@ const SK_BUFF_OVERHEAD: usize = 768;
 #[ctor::ctor]
 fn init() {
     tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_ansi(true)
+        .with_writer(std::io::stderr)
         .init();
     vcan_fixture::enter_namespace();
 }
