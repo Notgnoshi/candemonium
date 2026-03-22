@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use candumpr::can::{self, CanFrame, FRAME_SIZE};
+use candumpr::can::{self, CanFrame};
 use candumpr::recv::dedicated::DedicatedRecv;
 use candumpr::recv::epoll::EpollRecv;
 use candumpr::recv::recvmmsg::RecvmmsgRecv;
@@ -30,12 +30,6 @@ use gungraun::{library_benchmark, library_benchmark_group, main};
 use vcan_fixture::VcanHarness;
 
 const IFACE_COUNT: usize = 4;
-
-/// Conservative estimate of per-frame overhead in the kernel socket buffer.
-/// Includes sk_buff structure (~232 bytes on x86_64), data alignment, and
-/// internal kernel bookkeeping. Deliberately high to avoid overflowing the
-/// receive buffer.
-const SK_BUFF_OVERHEAD: usize = 768;
 
 #[ctor::ctor]
 fn init() {
@@ -79,12 +73,39 @@ fn open_and_prefill(names: &[String], blocking: bool) -> Vec<OwnedFd> {
         rx.push(sock);
     }
 
-    let frames_per_iface = estimate_buffer_frames(&rx[0]);
-    tracing::info!(frames_per_iface, "estimated buffer capacity");
+    // Measure the actual per-frame kernel overhead (sk_buff truesize) by sending
+    // one frame and observing the change in rmem_alloc via SO_MEMINFO. This
+    // replaces the previous hardcoded SK_BUFF_OVERHEAD constant.
+    let probe_tx = can::open_can_raw_blocking(&names[0]).unwrap();
+    let before = get_rmem_alloc(&rx[0]);
+    let probe = CanFrame::new(libc::CAN_EFF_FLAG, &[0; 8]);
+    can::send_frame(probe_tx.as_fd(), &probe).unwrap();
+    let after = get_rmem_alloc(&rx[0]);
+    let truesize = (after - before) as usize;
+    assert!(
+        truesize > 0,
+        "SO_MEMINFO rmem_alloc did not increase after send"
+    );
+
+    let rcvbuf = get_rcvbuf(&rx[0]);
+    // Subtract 1 to account for the probe frame we already sent.
+    let frames_per_iface = rcvbuf / truesize - 1;
+    tracing::info!(
+        truesize,
+        rcvbuf,
+        frames_per_iface,
+        "measured buffer capacity"
+    );
 
     for (iface_idx, name) in names.iter().enumerate() {
         let tx = can::open_can_raw_blocking(name).unwrap();
-        for frame_idx in 0..frames_per_iface {
+        // The first interface already has the probe frame; send one fewer.
+        let count = if iface_idx == 0 {
+            frames_per_iface
+        } else {
+            frames_per_iface + 1
+        };
+        for frame_idx in 0..count {
             let frame = CanFrame::new(
                 ((iface_idx as u32) << 8) | (frame_idx as u32) | libc::CAN_EFF_FLAG,
                 &[
@@ -100,14 +121,36 @@ fn open_and_prefill(names: &[String], blocking: bool) -> Vec<OwnedFd> {
             );
             can::send_frame(tx.as_fd(), &frame).unwrap();
         }
-        tracing::debug!(iface = iface_idx, frames_per_iface, "iface prefilled");
+        tracing::debug!(iface = iface_idx, count, "iface prefilled");
     }
 
     rx
 }
 
-/// Estimate how many CAN frames fit in a socket's receive buffer.
-fn estimate_buffer_frames(fd: &OwnedFd) -> usize {
+/// Read the current `rmem_alloc` for a socket via `SO_MEMINFO`.
+fn get_rmem_alloc(fd: &OwnedFd) -> u32 {
+    let mut info = [0u32; (libc::SK_MEMINFO_DROPS + 1) as usize];
+    let mut len: libc::socklen_t = std::mem::size_of_val(&info) as u32;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_MEMINFO,
+            info.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    assert_eq!(
+        ret,
+        0,
+        "getsockopt(SO_MEMINFO): {}",
+        std::io::Error::last_os_error()
+    );
+    info[libc::SK_MEMINFO_RMEM_ALLOC as usize]
+}
+
+/// Read the kernel receive buffer size (`SO_RCVBUF`).
+fn get_rcvbuf(fd: &OwnedFd) -> usize {
     let mut val: libc::c_int = 0;
     let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as u32;
     let ret = unsafe {
@@ -125,7 +168,7 @@ fn estimate_buffer_frames(fd: &OwnedFd) -> usize {
         "getsockopt(SO_RCVBUF): {}",
         std::io::Error::last_os_error()
     );
-    val as usize / (FRAME_SIZE + SK_BUFF_OVERHEAD)
+    val as usize
 }
 
 /// Safety-net deadline so benchmarks terminate even if frames were dropped.
