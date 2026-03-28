@@ -97,6 +97,9 @@ jobs:
             - name: Test (vcan)
               if: steps.vcan.outputs.available == 'true'
               run: cargo llvm-cov --no-report nextest --all-features --run-ignored ignored-only
+            # Run clippy twice - once with the 1.89 MSRV, and once with the latest stable toolchain
+            - name: Clippy
+              run: cargo clippy --no-deps --all-targets --all-features
             - name: Coverage report
               run: |
                   cargo llvm-cov report --cobertura --output-path coverage.xml
@@ -106,9 +109,6 @@ jobs:
                   PERCENT="$(echo "($RATE * 100)/1" | bc)"
                   echo "PERCENT=$PERCENT"
                   echo "COVERAGE_PERCENT=$PERCENT" >> $GITHUB_ENV
-            # Run clippy twice - once with the 1.89 MSRV, and once with the latest stable toolchain
-            - name: Clippy
-              run: cargo clippy --no-deps --all-targets --all-features
             - name: Update coverage badge
               uses: schneegans/dynamic-badges-action@v1.7.0
               if: github.ref_name == github.event.repository.default_branch
@@ -125,6 +125,20 @@ jobs:
                 valColorRange: ${{ env.COVERAGE_PERCENT }}
                 minColorRange: 40
                 maxColorRange: 65
+            - name: Setup nightly toolchain (ASAN)
+              uses: dtolnay/rust-toolchain@master
+              with:
+                toolchain: nightly
+                components: rust-src
+            - name: Test (ASAN)
+              env:
+                RUSTFLAGS: -D warnings -Zsanitizer=address
+              run: cargo +nightly nextest run -Zbuild-std --target x86_64-unknown-linux-gnu --all-features --no-tests=warn
+            - name: Test (ASAN, vcan)
+              if: steps.vcan.outputs.available == 'true'
+              env:
+                RUSTFLAGS: -D warnings -Zsanitizer=address
+              run: cargo +nightly nextest run -Zbuild-std --target x86_64-unknown-linux-gnu --all-features --run-ignored ignored-only
 
     # Canary job: verifies vcan is available on the runner. Shows yellow when the
     # linux-modules-extra package drifts from the runner kernel version, which means the socketcan
