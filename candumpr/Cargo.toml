@@ -13,12 +13,12 @@ ci = []
 eyre.workspace = true
 io-uring.workspace = true
 libc.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 ctor.workspace = true
 gungraun.workspace = true
 tabled.workspace = true
-tracing.workspace = true
 tracing-subscriber.workspace = true
 vcan-fixture = { path = "../vcan-fixture" }
 
