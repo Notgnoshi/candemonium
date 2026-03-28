@@ -8,7 +8,6 @@
 //! * DEFER_TASKRUN: defer all completion processing to explicit submit_with_args calls.
 //! * Registered file descriptors: avoid per-operation fd lookup in the kernel.
 //! * Batched wakeups: submit_with_args(BATCH_SIZE) reduces wakeup frequency.
-//! * Enlarged CQ ring: headroom for burst-induced multishot completions.
 //!
 //! Ancillary data:
 //! * Hardware timestamps (SCM_TIMESTAMPING) with software fallback.
@@ -25,8 +24,10 @@ use io_uring::{IoUring, cqueue, opcode, types};
 use crate::can::{self, CanFrame, FRAME_SIZE};
 use crate::recv::{FrameMeta, Timestamp};
 
-/// Number of provided buffers in the ring.
+/// Number of provided buffers (and CQ entries) in the ring. The CQ is sized to match so the
+/// kernel can post one completion per buffer without overflow. Must be a power of two.
 const FRAMEBUF_COUNT: u16 = 256;
+const _: () = assert!(FRAMEBUF_COUNT.is_power_of_two());
 
 /// Buffer group ID for the provided buffer ring. io_uring supports multiple buffer rings
 /// identified by group ID; we only use one.
@@ -36,10 +37,6 @@ const BGID: u16 = 0;
 /// latency. The 100ms timeout on submit_with_args ensures we still wake promptly for shutdown or
 /// when traffic is sparse.
 const BATCH_SIZE: usize = 4;
-
-/// CQ ring size. With multishot recv, a single SQE can generate many CQEs in a burst. A larger CQ
-/// ring prevents overflow (which terminates the multishot and forces resubmission).
-const CQ_SIZE: u32 = 64;
 
 /// Size of the `io_uring_recvmsg_out` header the kernel writes at the start of each provided
 /// buffer. This is a stable kernel ABI (4 x u32).
@@ -97,7 +94,7 @@ impl UringMultiRecv {
             .setup_single_issuer()
             .setup_coop_taskrun()
             .setup_defer_taskrun()
-            .setup_cqsize(CQ_SIZE)
+            .setup_cqsize(FRAMEBUF_COUNT as u32)
             .build(sq_size)?;
 
         // Register socket file descriptors so the kernel can skip per-op fd lookup. SQEs then use
@@ -218,7 +215,7 @@ impl UringMultiRecv {
             // Drain CQEs into a stack buffer, then process. This avoids heap allocation while
             // releasing the borrow on the completion queue before we need to touch the submission
             // queue or buffer ring.
-            let mut cqe_buf = [(0u64, 0i32, 0u32); CQ_SIZE as usize];
+            let mut cqe_buf = [(0u64, 0i32, 0u32); FRAMEBUF_COUNT as usize];
             let mut cqe_count = 0;
             for cqe in self.ring.completion() {
                 cqe_buf[cqe_count] = (cqe.user_data(), cqe.result(), cqe.flags());
@@ -229,9 +226,12 @@ impl UringMultiRecv {
                 let idx = ud as usize;
 
                 if result < 0 {
-                    let err = std::io::Error::from_raw_os_error(-result);
-                    if err.raw_os_error() != Some(libc::ECANCELED) {
-                        return Err(err);
+                    let err_code = -result;
+                    // ECANCELED: normal shutdown (SQE cancelled).
+                    // ENOBUFS: provided buffer ring exhausted; multishot terminated. The
+                    // resubmission logic below will restart it once buffers are returned.
+                    if err_code != libc::ECANCELED && err_code != libc::ENOBUFS {
+                        return Err(std::io::Error::from_raw_os_error(err_code));
                     }
                 } else if let Some(buf_id) = cqueue::buffer_select(flags) {
                     let buf_offset = buf_id as usize * BUF_ENTRY_SIZE;
