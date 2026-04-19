@@ -341,6 +341,7 @@ fn parse_control_data(control: &[u8]) -> FrameMeta {
                     }
                 }
                 libc::SO_RXQ_OVFL => {
+                    #[allow(clippy::collapsible_match)] // 1.95+
                     if data_len >= std::mem::size_of::<u32>() {
                         meta.drops = Some(unsafe {
                             std::ptr::read_unaligned(control.as_ptr().add(data_start) as *const u32)
