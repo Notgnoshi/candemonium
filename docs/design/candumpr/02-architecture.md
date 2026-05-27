@@ -42,11 +42,12 @@ graph TD
         io_uring
     end
 
-    io_uring --> |"SPSC (unbounded)"| main_loop
+    io_uring --> |"SPSC: Vec<CanFrame>"| main_loop
+    main_loop -.-> |"SPSC: recycled Vec"| io_uring
 
     subgraph main [Main thread]
-        main_loop["recv_timeout / try_recv drain loop"]
-        main_loop --> |CanFrame| Pipeline
+        main_loop["recv_timeout"]
+        main_loop --> |"&[CanFrame]"| Pipeline
     end
 
     subgraph Pipeline
@@ -76,12 +77,12 @@ graph TD
 
 The pipeline has four layers:
 
-| Layer     | Responsibility                                                                                                                                                                                                                                                   |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Main loop | Recv frames from SPSC channel, call `pipeline.write_frame()`, forward SIGHUP via `pipeline.rotate()`, call `pipeline.flush()` on idle timeout, `pipeline.close()` on STOP                                                                                        |
-| Pipeline  | Owns one Formatter and a `Vec<Sink>` whose length is either 1 (single-file mode) or the number of interfaces (per-interface mode). Formats frame into a shared buffer, dispatches bytes to the Sink for `frame.iface_idx`, or to `sinks[0]` in single-file mode. |
-| Sink      | Two-state machine (Pending/Active). Owns filename template, rotation config, retention config, header blob, file index. Handles deferred file creation, rotation decisions, retention cleanup. Constructs the Writer stack on activation.                        |
-| Writers   | Composable, each wraps a generic inner Writer. Trait has `write`, `flush`, and `finish`. Leaf implementations are FileWriter and StdoutWriter.                                                                                                                   |
+| Layer     | Responsibility                                                                                                                                                                                                                                      |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Main loop | Recv batches from SPSC channel, call `pipeline.write_batch()`, recycle the batch Vec back to the receiver, forward SIGHUP via `pipeline.rotate()`, call `pipeline.flush()` on idle timeout, `pipeline.close()` on STOP                              |
+| Pipeline  | Owns one Formatter and a `Vec<Sink>` whose length is either 1 (single-file mode) or the number of interfaces (per-interface mode). Formats each frame into a per-Sink scratch buffer, then writes each non-empty buffer to its Sink once per batch. |
+| Sink      | Two-state machine (Pending/Active). Owns filename template, rotation config, retention config, header blob, file index. Handles deferred file creation, rotation decisions, retention cleanup. Constructs the Writer stack on activation.           |
+| Writers   | Composable, each wraps a generic inner Writer. Trait has `write`, `flush`, and `finish`. Leaf implementations are FileWriter and StdoutWriter.                                                                                                      |
 
 ## Receiver detail
 
@@ -106,22 +107,32 @@ infinitely increase the batch size - there's a tipping point at which if we incr
 run the risk of filling up the recvbuf. A batch size of 32 or 64 seems like a reasonable upper
 limit.
 
+## Batching CanFrames
+
+Sending the `CanFrame`s in batches over the channel allows the writer to format and write the whole
+batch at once, which is a nice property. Using a second channel to send emptied `Vec`s back to the
+receiver allows us to re-use the allocations without repeated high frequency alloc/free cycles.
+
+* At startup, a small pool of pre-allocated Vecs is pushed into the recycle channel.
+* The receiver pulls a Vec from the recycle channel via `try_recv` and falls back to a fresh
+  allocation if the pool is empty.
+* The main loop receives a batch, hands it to the Pipeline, clears the Vec and `try_send`s it back
+  to the recycle channel. If the recycle channel is full, the Vec is dropped.
+
 ## Main loop detail
 
-The main loop runs on the main thread. It receives frames from the SPSC channel and hands them to
-the Pipeline. The loop drains all ready frames, relying on a byte threshold inside the Sink to
-trigger flushes during normal operation:
+The main loop runs on the main thread. It receives batches from the SPSC channel and hands them to
+the Pipeline, relying on a byte threshold inside the Sink to trigger flushes during normal
+operation:
 
 ```rust
 send_address_claims(&claim_ifaces)
 
 loop {
-    match rx.recv_timeout(100ms) {
-        Ok(frame) => {
-            pipeline.write_frame(&frame)
-            while let Ok(frame) = rx.try_recv() {
-                pipeline.write_frame(&frame)
-            }
+    match full_rx.recv_timeout(100ms) {
+        Ok(batch) => {
+            pipeline.write_batch(&batch)
+            recycle(batch)
         }
         Err(Timeout) => pipeline.flush()
     }
@@ -134,16 +145,16 @@ loop {
 }
 ```
 
-The `try_recv` drain terminates because the receiver produces frames at a finite rate bounded by the
-CAN bus speeds.
+Each batch represents one CQE drain from the receiver, so the main loop does not need to perform its
+own draining: a batch already coalesces frames that were ready together.
 
-Flushing is driven by a byte threshold inside the Sink, not by the drain loop. Each `write_frame`
-call tracks bytes written since the last flush. When the threshold is crossed, the Sink calls
-`writer.flush()` inline during the write. This produces predictable flush granularity regardless of
-traffic burstiness. `flush()` is unconditional at each layer of the Writer stack: the Sink is the
-single place that decides when to call it.
+Flushing is driven by a byte threshold inside the Sink, not by the batching loop. Each `write_batch`
+call tracks bytes written to each Sink since the last flush. When the threshold is crossed, the Sink
+calls `writer.flush()` between writes (never mid-write). This produces predictable flush granularity
+regardless of traffic burstiness. `flush()` is unconditional at each layer of the Writer stack: the
+Sink is the single place that decides when to call it.
 
-The 100ms `recv_timeout` is a safety net for idle periods: when no frames arrive, the timeout fires
+The 100ms `recv_timeout` is a safety net for idle periods: when no batches arrive, the timeout fires
 and `pipeline.flush()` pushes out whatever is buffered. Under normal load this timeout rarely fires.
 
 Signal handling is cooperative: the main loop checks atomic flags between iterations. SIGHUP
@@ -169,23 +180,28 @@ offline analysis.
 
 ## Pipeline detail
 
-The Pipeline owns a single Formatter and a `Vec<Sink>`.
+The Pipeline owns a single Formatter, a `Vec<Sink>`, and one scratch format buffer per Sink.
 
 When the output path template contains `{interface}`, `sinks.len() == n_interfaces` and frames are
 dispatched by `frame.iface_idx`. Otherwise, `sinks.len() == 1`, all traffic is interleaved into that
 single Sink, and `frame.iface_idx` is used only by the Formatter (for the interface-name column in
 formats that need it), not for dispatch.
 
-On `write_frame(&CanFrame)`:
+On `write_batch(&[CanFrame])`:
 
-1. Format the frame into a shared `Vec<u8>` buffer using the Formatter
-2. Dispatch the formatted bytes to the target Sink: `sinks[frame.iface_idx]` in per-interface mode,
-   or `sinks[0]` in single-file mode
+1. Clear each Sink's scratch buffer.
+2. For each frame in the batch, format it into the buffer of its target Sink: `sinks[iface_idx]` in
+   per-interface mode, or `sinks[0]` in single-file mode.
+3. For each Sink with a non-empty buffer, call `sink.write(buf)` exactly once.
 
-On `flush()`, `rotate()`, and `close()`: forward to all unique Sinks.
+This collapses every frame in the batch destined for a given Sink into a single `sink.write` call,
+preserving the invariant that each `sink.write` carries whole formatted frames. In single-sink mode
+that is one write per batch; in per-interface mode, one write per (interface, batch) pair.
+
+On `flush()`, `rotate()`, and `close()`: forward to each Sink.
 
 On `take_rotated()`: return and clear the set of interface indices whose Sinks rotated during
-`write_frame()`. This allows the main loop to send address claim requests for interfaces that
+`write_batch()`. This allows the main loop to send address claim requests for interfaces that
 rotated due to size or duration limits.
 
 ## Formatter detail
