@@ -67,7 +67,7 @@ graph TD
         direction LR
         compressed["ZstdWriter&lt;FileWriter&gt;"]
         uncompressed["BufWriter&lt;FileWriter&gt;"]
-        live["BufWriter&lt;StdoutWriter&gt;"]
+        live["StdoutWriter"]
     end
 
     sink --> writers
@@ -367,12 +367,16 @@ Writer:
 | -------------------- | -------------------------- |
 | File, uncompressed   | BufWriter\<FileWriter\>    |
 | File, compressed     | ZstdWriter\<FileWriter\>   |
-| Stdout, uncompressed | BufWriter\<StdoutWriter\>  |
+| Stdout, uncompressed | StdoutWriter               |
 | Stdout, compressed   | ZstdWriter\<StdoutWriter\> |
 
 No BufWriter wraps the ZstdWriter because the zstd encoder already batches output into block-sized
 chunks. The BufWriter is only needed when many small formatted frames (uncompressed) need to be
 batched into fewer `write()` syscalls.
+
+We don't buffer writes to stdout because when used interactively, candumpr should be responsive. The
+low-performance-impact goal matters most for the logging-daemon use case, and less for interactive
+troubleshooting.
 
 ### Flush behavior summary
 
