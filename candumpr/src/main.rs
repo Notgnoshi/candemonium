@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use candumpr::can;
 use candumpr::format::{CanutilsFormatter, Formatter};
-use candumpr::recv::receiver::Receiver;
+use candumpr::recv::receiver::{BATCH_CAPACITY, Receiver};
 use candumpr::write::{StdoutWriter, Writer};
 use clap::Parser;
 
@@ -42,7 +42,16 @@ fn main() -> eyre::Result<()> {
         .map(|name| can::open_can_raw(name))
         .collect::<std::io::Result<_>>()?;
 
-    let (tx, rx) = mpsc::channel();
+    const POOL_SIZE: usize = 4;
+    const RECYCLE_BOUND: usize = 8;
+
+    let (full_tx, full_rx) = mpsc::channel::<Vec<_>>();
+    let (empty_tx, empty_rx) = mpsc::sync_channel::<Vec<_>>(RECYCLE_BOUND);
+    for _ in 0..POOL_SIZE {
+        empty_tx
+            .send(Vec::with_capacity(BATCH_CAPACITY))
+            .expect("recycle channel must accept initial pool");
+    }
 
     unsafe {
         libc::signal(
@@ -53,7 +62,7 @@ fn main() -> eyre::Result<()> {
 
     let recv_handle = std::thread::spawn(move || -> eyre::Result<u64> {
         let mut recv = Receiver::new(sockets)?;
-        let total = recv.run(&STOP, &tx)?;
+        let total = recv.run(&STOP, &full_tx, &empty_rx)?;
         Ok(total)
     });
 
@@ -62,24 +71,28 @@ fn main() -> eyre::Result<()> {
     let mut buf = Vec::with_capacity(4096);
 
     while !STOP.load(Ordering::Relaxed) {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(frame) => {
-                formatter.format(&frame, &mut buf);
-                // Drain any additional frames that are immediately ready.
-                while let Ok(frame) = rx.try_recv() {
-                    formatter.format(&frame, &mut buf);
+        match full_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(mut batch) => {
+                for frame in &batch {
+                    formatter.format(frame, &mut buf);
                 }
                 writer.write(&buf)?;
                 buf.clear();
+                batch.clear();
+                let _ = empty_tx.try_send(batch);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
-    // Drain remaining frames after stop.
-    while let Ok(frame) = rx.try_recv() {
-        formatter.format(&frame, &mut buf);
+    // Drain remaining batches after stop.
+    while let Ok(mut batch) = full_rx.try_recv() {
+        for frame in &batch {
+            formatter.format(frame, &mut buf);
+        }
+        batch.clear();
+        let _ = empty_tx.try_send(batch);
     }
     if !buf.is_empty() {
         writer.write(&buf)?;

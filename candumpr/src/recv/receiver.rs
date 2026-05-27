@@ -1,6 +1,7 @@
 use std::alloc::Layout;
 use std::os::unix::io::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::mpsc;
 
 use io_uring::types::BufRingEntry;
 use io_uring::{IoUring, cqueue, opcode, types};
@@ -12,6 +13,10 @@ use crate::recv::Timestamp;
 /// Number of provided buffers (and CQ entries) in the ring. Must be a power of two.
 const FRAMEBUF_COUNT: u16 = 256;
 const _: () = assert!(FRAMEBUF_COUNT.is_power_of_two());
+
+/// Capacity of a batch Vec sent over the SPSC channel. Sized to match the maximum number of
+/// CQEs that can be drained in one cycle.
+pub const BATCH_CAPACITY: usize = FRAMEBUF_COUNT as usize;
 
 const BGID: u16 = 0;
 
@@ -112,13 +117,15 @@ impl Receiver {
 
     /// Run the receive loop until `stop` is set.
     ///
-    /// Each received frame is sent through `tx` as a [CanFrame]. If the channel is disconnected
-    /// (writer thread dropped), the receiver treats it as a shutdown signal. Returns the total
-    /// number of frames received.
+    /// Each CQE drain produces a Vec of [CanFrame] which is sent through `full_tx`.
+    /// Empty Vecs are pulled from `empty_rx` and reused, falling back to a fresh allocation
+    /// when the recycle channel is empty. If `full_tx` is disconnected (writer thread dropped),
+    /// the receiver treats it as a shutdown signal. Returns the total number of frames received.
     pub fn run(
         &mut self,
         stop: &AtomicBool,
-        tx: &std::sync::mpsc::Sender<CanFrame>,
+        full_tx: &mpsc::Sender<Vec<CanFrame>>,
+        empty_rx: &mpsc::Receiver<Vec<CanFrame>>,
     ) -> std::io::Result<u64> {
         let mut total = 0u64;
         // We wait for BATCH_SIZE completions before waking up, but we still want to be able to
@@ -163,6 +170,10 @@ impl Receiver {
                 cqe_count += 1;
             }
 
+            let mut batch = empty_rx
+                .try_recv()
+                .unwrap_or_else(|_| Vec::with_capacity(BATCH_CAPACITY));
+
             for &(ud, result, flags) in &cqe_buf[..cqe_count] {
                 let idx = ud as usize;
 
@@ -184,17 +195,12 @@ impl Receiver {
                             let meta = parse_control_data(out.control_data());
                             let timestamp = meta.timestamp.unwrap_or(Timestamp { sec: 0, nsec: 0 });
 
-                            let frame = CanFrame {
+                            batch.push(CanFrame {
                                 iface_idx: idx,
                                 timestamp,
                                 direction: Direction::Rx,
                                 raw,
-                            };
-
-                            if tx.send(frame).is_err() {
-                                // Channel disconnected; writer thread is gone.
-                                return Ok(total);
-                            }
+                            });
                             total += 1;
                         }
                     }
@@ -210,6 +216,11 @@ impl Receiver {
                         pending_resubmit.push(idx);
                     }
                 }
+            }
+
+            if !batch.is_empty() && full_tx.send(batch).is_err() {
+                // Channel disconnected; writer thread is gone.
+                return Ok(total);
             }
         }
 
@@ -337,23 +348,33 @@ mod tests {
 
         static STOP: AtomicBool = AtomicBool::new(false);
         STOP.store(false, Ordering::Relaxed);
-        let (tx, rx_chan) = mpsc::channel();
+        let (full_tx, full_rx) = mpsc::channel::<Vec<_>>();
+        let (empty_tx, empty_rx) = mpsc::sync_channel::<Vec<_>>(8);
+        for _ in 0..4 {
+            empty_tx
+                .send(Vec::with_capacity(super::BATCH_CAPACITY))
+                .unwrap();
+        }
 
         // Receiver must be created on the same thread that calls run() due to SINGLE_ISSUER.
         let handle = std::thread::spawn(move || {
             let mut recv = Receiver::new(rx_sockets).unwrap();
-            recv.run(&STOP, &tx)
+            recv.run(&STOP, &full_tx, &empty_rx)
         });
 
         let mut count = 0u64;
         while count < TOTAL_FRAMES {
-            let frame = rx_chan
+            let mut batch = full_rx
                 .recv_timeout(std::time::Duration::from_millis(100))
                 .unwrap();
-            assert!(frame.iface_idx < IFACE_COUNT);
-            assert_eq!(frame.direction, Direction::Rx);
-            assert!(frame.raw.len <= 8);
-            count += 1;
+            for frame in &batch {
+                assert!(frame.iface_idx < IFACE_COUNT);
+                assert_eq!(frame.direction, Direction::Rx);
+                assert!(frame.raw.len <= 8);
+                count += 1;
+            }
+            batch.clear();
+            let _ = empty_tx.try_send(batch);
         }
 
         STOP.store(true, Ordering::Relaxed);
