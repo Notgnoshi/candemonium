@@ -77,12 +77,12 @@ graph TD
 
 The pipeline has four layers:
 
-| Layer     | Responsibility                                                                                                                                                                                                                                      |
-| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Main loop | Recv batches from SPSC channel, call `pipeline.write_batch()`, recycle the batch Vec back to the receiver, forward SIGHUP via `pipeline.rotate()`, call `pipeline.flush()` on idle timeout, `pipeline.close()` on STOP                              |
-| Pipeline  | Owns one Formatter and a `Vec<Sink>` whose length is either 1 (single-file mode) or the number of interfaces (per-interface mode). Formats each frame into a per-Sink scratch buffer, then writes each non-empty buffer to its Sink once per batch. |
-| Sink      | Two-state machine (Pending/Active). Owns filename template, rotation config, retention config, header blob, file index. Handles deferred file creation, rotation decisions, retention cleanup. Constructs the Writer stack on activation.           |
-| Writers   | Composable, each wraps a generic inner Writer. Trait has `write`, `flush`, and `finish`. Leaf implementations are FileWriter and StdoutWriter.                                                                                                      |
+| Layer     | Responsibility                                                                                                                                                                                                                                                             |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Main loop | Recv batches from SPSC channel, call `pipeline.write_batch()`, recycle the batch Vec back to the receiver, forward SIGHUP via `pipeline.rotate()`, call `pipeline.flush()` on idle timeout, `pipeline.close()` on STOP                                                     |
+| Pipeline  | Owns one Formatter and a `Vec<Sink>` whose length is either 1 (single-file mode) or the number of interfaces (per-interface mode). Formats each frame into a per-Sink scratch buffer, then writes each non-empty buffer to its Sink once per batch.                        |
+| Sink      | Three-state machine (Pending/Active/Closed). Owns filename template, rotation config, retention config, header blob, file index. Handles deferred file creation, rotation decisions, retention cleanup. Constructs the Writer stack on activation. Terminal after `close`. |
+| Writers   | Composable, each wraps a generic inner Writer. Trait has `write`, `flush`, and `finish`. Leaf implementations are FileWriter and StdoutWriter.                                                                                                                             |
 
 ## Receiver detail
 
@@ -222,7 +222,7 @@ Output formats: can-utils candump (file and console variants), Vector ASC, PCAP.
 
 ## Sink detail
 
-The Sink is a two-state machine that manages one output destination.
+The Sink is a three-state machine that manages one output destination.
 
 ```mermaid
 stateDiagram-v2
@@ -230,8 +230,9 @@ stateDiagram-v2
     Pending --> Active : first write (resolve filename, open file, write header)
     Active --> Active : write (within rotation threshold)
     Active --> Pending : rotate (size/time limit hit, or SIGHUP)
-    Active --> [*] : close (finalize, fsync)
-    Pending --> [*] : close (no-op)
+    Active --> Closed : close (finalize, fsync)
+    Pending --> Closed : close (no-op)
+    Closed --> [*]
 ```
 
 ### Pending state
@@ -257,6 +258,14 @@ Adds the live output state:
   Sink queries it after each write.
 * File open instant from the monotonic clock (for duration-based rotation tracking)
 * Current filename (for logging rotation events to stderr)
+
+### Closed state
+
+Terminal state. Reached by `close`, which calls `writer.finish()` if the Sink was Active (flushing
+buffers, writing the zstd frame epilogue if compressed, fsyncing the file) or no-ops if the Sink was
+Pending. A Closed Sink does not accept further writes: subsequent `write` calls return an error
+rather than re-opening the file. `flush`, `rotate`, and `close` on an already-Closed Sink are
+no-ops.
 
 ### Deferred file creation
 
