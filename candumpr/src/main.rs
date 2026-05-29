@@ -5,7 +5,7 @@ use std::time::Duration;
 use candumpr::can;
 use candumpr::format::{CanutilsFormatter, Formatter};
 use candumpr::recv::receiver::{BATCH_CAPACITY, Receiver};
-use candumpr::write::{StdoutWriter, Writer};
+use candumpr::writer::{StdoutWriter, Writer};
 use clap::Parser;
 
 static STOP: AtomicBool = AtomicBool::new(false);
