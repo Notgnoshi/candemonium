@@ -2,6 +2,7 @@ pub mod can;
 pub mod format;
 pub mod frame;
 pub mod recv;
+pub mod sink;
 pub mod writer;
 
 #[cfg(test)]
