@@ -1,11 +1,14 @@
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use candumpr::can;
 use candumpr::format::{CanutilsFormatter, Formatter};
+use candumpr::pipeline::Pipeline;
 use candumpr::recv::receiver::{BATCH_CAPACITY, Receiver};
-use candumpr::writer::{StdoutWriter, Writer};
+use candumpr::sink::Sink;
+use candumpr::writer::StdoutWriter;
 use clap::Parser;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -27,8 +30,11 @@ struct Cli {
     log_level: tracing::Level,
 }
 
-fn main() -> eyre::Result<()> {
-    color_eyre::install()?;
+fn main() -> ExitCode {
+    if let Err(e) = color_eyre::install() {
+        eprintln!("failed to install error handler: {e:#}");
+        return ExitCode::FAILURE;
+    }
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
@@ -36,11 +42,18 @@ fn main() -> eyre::Result<()> {
         .with_max_level(cli.log_level)
         .init();
 
-    let sockets: Vec<_> = cli
+    let sockets: Vec<_> = match cli
         .interfaces
         .iter()
         .map(|name| can::open_can_raw(name))
-        .collect::<std::io::Result<_>>()?;
+        .collect::<std::io::Result<_>>()
+    {
+        Ok(sockets) => sockets,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to open CAN sockets");
+            return ExitCode::FAILURE;
+        }
+    };
 
     const POOL_SIZE: usize = 4;
     const RECYCLE_BOUND: usize = 8;
@@ -67,39 +80,72 @@ fn main() -> eyre::Result<()> {
     });
 
     let formatter = CanutilsFormatter::new(cli.interfaces);
-    let mut writer = StdoutWriter::new();
-    let mut buf = Vec::with_capacity(4096);
+    let header = formatter.header().map(|h| h.to_vec());
+    let sink = Sink::new(
+        StdoutWriter::new(),
+        header,
+        64 * 1024,
+        Some(Duration::from_secs(5)),
+        Some(Duration::from_secs(5 * 60)),
+    );
+    let mut pipeline = Pipeline::new(formatter, vec![sink]);
+
+    // Write-path errors are logged and recorded rather than propagated: returning early would skip
+    // draining the remaining batches and closing the pipeline, both of which can lose buffered data.
+    // Every error sets `failed` so the process still exits nonzero.
+    let mut failed = false;
 
     while !STOP.load(Ordering::Relaxed) {
         match full_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(mut batch) => {
-                for frame in &batch {
-                    formatter.format(frame, &mut buf);
+                if let Err(e) = pipeline.write_batch(&batch) {
+                    tracing::error!(error = ?e, "failed to write batch");
+                    failed = true;
                 }
-                writer.write(&buf)?;
-                buf.clear();
                 batch.clear();
                 let _ = empty_tx.try_send(batch);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if let Err(e) = pipeline.tick() {
+            tracing::error!(error = ?e, "periodic flush or sync failed");
+            failed = true;
         }
     }
 
-    // Drain remaining batches after stop.
+    // Drain whatever is still queued after the stop signal.
     while let Ok(mut batch) = full_rx.try_recv() {
-        for frame in &batch {
-            formatter.format(frame, &mut buf);
+        if let Err(e) = pipeline.write_batch(&batch) {
+            tracing::error!(error = ?e, "failed to write batch during drain");
+            failed = true;
         }
         batch.clear();
         let _ = empty_tx.try_send(batch);
     }
-    if !buf.is_empty() {
-        writer.write(&buf)?;
+
+    // close() always runs, even after write errors: for file and zstd writers it is what writes the
+    // epilogue and fsyncs, so skipping it could leave output unrecoverable.
+    if let Err(e) = pipeline.close() {
+        tracing::error!(error = ?e, "failed to close pipeline");
+        failed = true;
     }
 
-    let total = recv_handle.join().expect("receiver thread panicked")?;
-    tracing::debug!(total, "receiver finished");
+    match recv_handle.join() {
+        Ok(Ok(total)) => tracing::debug!(total_frames = total, "receiver finished"),
+        Ok(Err(e)) => {
+            tracing::error!(error = ?e, "receiver thread failed");
+            failed = true;
+        }
+        Err(_) => {
+            tracing::error!("receiver thread panicked");
+            failed = true;
+        }
+    }
 
-    Ok(())
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
