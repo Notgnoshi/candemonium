@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use candumpr::can;
+use candumpr::errframe::{BusState, ErrorFrame};
 use candumpr::format::{CanutilsFormatter, Formatter};
+use candumpr::frame::CanFrame;
 use candumpr::pipeline::Pipeline;
 use candumpr::recv::netlink::{self, LinkEvent};
 use candumpr::recv::receiver::{BATCH_CAPACITY, Receiver};
@@ -34,6 +36,35 @@ fn handle_link_event(event: LinkEvent, link_up: &mut [Option<bool>], names: &[St
         tracing::info!(interface = %interface, "interface link up");
     } else {
         tracing::warn!(interface = %interface, "interface link down");
+    }
+}
+
+/// Log each error frame in `batch` at debug level, and log bus-state transitions (edges only).
+fn log_error_frames(batch: &[CanFrame], bus_state: &mut [BusState], names: &[String]) {
+    for frame in batch {
+        let Some(err) = ErrorFrame::parse(&frame.raw) else {
+            continue;
+        };
+        let interface = &names[frame.sock_id];
+        tracing::debug!(interface = %interface, error = %err, "CAN error frame");
+
+        let Some(new) = err.bus_state() else {
+            continue;
+        };
+        let old = bus_state[frame.sock_id];
+        if old == new {
+            continue;
+        }
+        bus_state[frame.sock_id] = new;
+        match new {
+            BusState::ErrorActive => {
+                tracing::info!(interface = %interface, "bus state {old} -> {new}")
+            }
+            BusState::ErrorWarning | BusState::ErrorPassive => {
+                tracing::warn!(interface = %interface, "bus state {old} -> {new}")
+            }
+            BusState::BusOff => tracing::error!(interface = %interface, "bus state {old} -> {new}"),
+        }
     }
 }
 
@@ -123,6 +154,8 @@ fn main() -> ExitCode {
     let names = cli.interfaces.clone();
     // Last observed link state per sock_id, so we log only edges.
     let mut link_up: Vec<Option<bool>> = vec![None; names.len()];
+    // Last logged bus state per sock_id, so we log only transitions.
+    let mut bus_state: Vec<BusState> = vec![BusState::default(); names.len()];
 
     let formatter = CanutilsFormatter::new(cli.interfaces);
     let header = formatter.header().map(|h| h.to_vec());
@@ -144,6 +177,7 @@ fn main() -> ExitCode {
         select! {
             recv(full_rx) -> msg => match msg {
                 Ok(mut batch) => {
+                    log_error_frames(&batch, &mut bus_state, &names);
                     if let Err(e) = pipeline.write_batch(&batch) {
                         tracing::error!(error = ?e, "failed to write batch");
                         failed = true;
