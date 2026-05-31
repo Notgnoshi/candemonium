@@ -1,7 +1,6 @@
 use std::alloc::Layout;
 use std::os::unix::io::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::mpsc;
 
 use io_uring::types::BufRingEntry;
 use io_uring::{IoUring, cqueue, opcode, types};
@@ -35,7 +34,7 @@ const CMSG_BUF_SIZE: usize = 128;
 const BUF_ENTRY_SIZE: usize = RECVMSG_OUT_HDR + CMSG_BUF_SIZE + FRAME_SIZE;
 
 /// Receives CAN frames from multiple interfaces using io_uring multishot RecvMsgMulti and sends
-/// them to the writer thread through an mpsc channel.
+/// them to the writer thread through a crossbeam channel.
 pub struct Receiver {
     ring: IoUring,
     sockets: Vec<OwnedFd>,
@@ -124,8 +123,8 @@ impl Receiver {
     pub fn run(
         &mut self,
         stop: &AtomicBool,
-        full_tx: &mpsc::Sender<Vec<CanFrame>>,
-        empty_rx: &mpsc::Receiver<Vec<CanFrame>>,
+        full_tx: &crossbeam_channel::Sender<Vec<CanFrame>>,
+        empty_rx: &crossbeam_channel::Receiver<Vec<CanFrame>>,
     ) -> std::io::Result<u64> {
         let mut total = 0u64;
         // We wait for BATCH_SIZE completions before waking up, but we still want to be able to
@@ -313,7 +312,6 @@ fn parse_control_data(control: &[u8]) -> FrameMeta {
 mod tests {
     use std::os::unix::io::AsFd;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
 
     use super::Receiver;
     use crate::can::{self, LinuxCanFrame};
@@ -348,8 +346,8 @@ mod tests {
 
         static STOP: AtomicBool = AtomicBool::new(false);
         STOP.store(false, Ordering::Relaxed);
-        let (full_tx, full_rx) = mpsc::channel::<Vec<_>>();
-        let (empty_tx, empty_rx) = mpsc::sync_channel::<Vec<_>>(8);
+        let (full_tx, full_rx) = crossbeam_channel::unbounded::<Vec<_>>();
+        let (empty_tx, empty_rx) = crossbeam_channel::bounded::<Vec<_>>(8);
         for _ in 0..4 {
             empty_tx
                 .send(Vec::with_capacity(super::BATCH_CAPACITY))

@@ -17,6 +17,7 @@ description = "Opinionated CAN utilities written in Rust"
 assert_cmd = { version = "2.2.0", features = ["color-auto"] }
 clap = { version = "4", features = ["derive"] }
 color-eyre = "0.6"
+crossbeam-channel = "0.5"
 ctor = "0.6"
 eyre = "0.6"
 gungraun = "0.17"

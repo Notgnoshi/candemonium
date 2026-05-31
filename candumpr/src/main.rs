@@ -1,7 +1,6 @@
 use std::os::unix::io::AsFd;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::time::Duration;
 
 use candumpr::can;
@@ -11,6 +10,7 @@ use candumpr::recv::receiver::{BATCH_CAPACITY, Receiver};
 use candumpr::sink::Sink;
 use candumpr::writer::StdoutWriter;
 use clap::Parser;
+use crossbeam_channel::select;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -76,8 +76,8 @@ fn main() -> ExitCode {
     const POOL_SIZE: usize = 4;
     const RECYCLE_BOUND: usize = 8;
 
-    let (full_tx, full_rx) = mpsc::channel::<Vec<_>>();
-    let (empty_tx, empty_rx) = mpsc::sync_channel::<Vec<_>>(RECYCLE_BOUND);
+    let (full_tx, full_rx) = crossbeam_channel::unbounded::<Vec<_>>();
+    let (empty_tx, empty_rx) = crossbeam_channel::bounded::<Vec<_>>(RECYCLE_BOUND);
     for _ in 0..POOL_SIZE {
         empty_tx
             .send(Vec::with_capacity(BATCH_CAPACITY))
@@ -112,24 +112,32 @@ fn main() -> ExitCode {
     // Every error sets `failed` so the process still exits nonzero.
     let mut failed = false;
 
-    while !STOP.load(Ordering::Relaxed) {
-        match full_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(mut batch) => {
-                if let Err(e) = pipeline.write_batch(&batch) {
-                    tracing::error!(error = ?e, "failed to write batch");
-                    failed = true;
+    loop {
+        select! {
+            recv(full_rx) -> msg => match msg {
+                Ok(mut batch) => {
+                    if let Err(e) = pipeline.write_batch(&batch) {
+                        tracing::error!(error = ?e, "failed to write batch");
+                        failed = true;
+                    }
+                    batch.clear();
+                    let _ = empty_tx.try_send(batch);
                 }
-                batch.clear();
-                let _ = empty_tx.try_send(batch);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(_) => break,
+            },
+            default(Duration::from_millis(100)) => {}
         }
         if let Err(e) = pipeline.tick() {
             tracing::error!(error = ?e, "periodic flush or sync failed");
             failed = true;
         }
+        if STOP.load(Ordering::Relaxed) {
+            break;
+        }
     }
+
+    // Set STOP so the receiver exits even if we broke out on a channel disconnect.
+    STOP.store(true, Ordering::Relaxed);
 
     // Join before draining so we write every received frame.
     match recv_handle.join() {
