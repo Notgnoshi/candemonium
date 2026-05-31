@@ -34,15 +34,24 @@ impl Formatter for CanutilsFormatter {
     fn format(&self, frame: &CanFrame, buf: &mut Vec<u8>) {
         let ts = &frame.timestamp;
         let iface = &self.iface_names[frame.sock_id];
-        let id = frame.raw.can_id & !libc::CAN_EFF_FLAG & !libc::CAN_RTR_FLAG & !libc::CAN_ERR_FLAG;
+        let can_id = frame.raw.can_id;
+
+        let (id, width) = if can_id & libc::CAN_ERR_FLAG != 0 {
+            (can_id & (libc::CAN_ERR_MASK | libc::CAN_ERR_FLAG), 8)
+        } else if can_id & libc::CAN_EFF_FLAG != 0 {
+            (can_id & libc::CAN_EFF_MASK, 8)
+        } else {
+            (can_id & libc::CAN_SFF_MASK, 3)
+        };
 
         write!(
             buf,
-            "({}.{:06}) {} {:08X}#",
+            "({}.{:06}) {} {:0width$X}#",
             ts.sec,
             ts.nsec / 1000,
             iface,
-            id
+            id,
+            width = width,
         )
         .unwrap();
         for i in 0..frame.raw.len as usize {
@@ -98,5 +107,38 @@ mod tests {
             String::from_utf8(buf).unwrap(),
             "(0.000000) vcan1 00000123#\n"
         );
+    }
+
+    #[test]
+    fn canutils_format_error_frame_keeps_err_flag() {
+        let frame = CanFrame {
+            sock_id: 0,
+            timestamp: Timestamp { sec: 1, nsec: 0 },
+            direction: Direction::Rx,
+            raw: LinuxCanFrame::new(libc::CAN_ERR_FLAG | 0x40, &[0, 0, 0, 0, 0, 0, 0, 0]),
+        };
+        let names = vec!["can0".to_string()];
+        let fmt = CanutilsFormatter::new(names);
+        let mut buf = Vec::new();
+        fmt.format(&frame, &mut buf);
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "(1.000000) can0 20000040#0000000000000000\n"
+        );
+    }
+
+    #[test]
+    fn canutils_format_standard_frame_uses_three_digits() {
+        let frame = CanFrame {
+            sock_id: 0,
+            timestamp: Timestamp { sec: 0, nsec: 0 },
+            direction: Direction::Rx,
+            raw: LinuxCanFrame::new(0x123, &[0xAB]),
+        };
+        let names = vec!["can0".to_string()];
+        let fmt = CanutilsFormatter::new(names);
+        let mut buf = Vec::new();
+        fmt.format(&frame, &mut buf);
+        assert_eq!(String::from_utf8(buf).unwrap(), "(0.000000) can0 123#AB\n");
     }
 }

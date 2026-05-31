@@ -83,6 +83,20 @@ fn open_can_socket(ifname: &str, flags: i32) -> std::io::Result<OwnedFd> {
         return Err(std::io::Error::last_os_error());
     }
 
+    let err_mask = libc::CAN_ERR_MASK;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_CAN_RAW,
+            libc::CAN_RAW_ERR_FILTER,
+            std::ptr::from_ref(&err_mask).cast::<libc::c_void>(),
+            std::mem::size_of_val(&err_mask) as u32,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
     Ok(fd)
 }
 
