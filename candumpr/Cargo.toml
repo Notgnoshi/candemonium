@@ -17,6 +17,7 @@ crossbeam-channel.workspace = true
 eyre.workspace = true
 io-uring.workspace = true
 libc.workspace = true
+neli.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

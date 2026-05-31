@@ -6,6 +6,7 @@ use std::time::Duration;
 use candumpr::can;
 use candumpr::format::{CanutilsFormatter, Formatter};
 use candumpr::pipeline::Pipeline;
+use candumpr::recv::netlink::{self, LinkEvent};
 use candumpr::recv::receiver::{BATCH_CAPACITY, Receiver};
 use candumpr::sink::Sink;
 use candumpr::writer::StdoutWriter;
@@ -16,6 +17,24 @@ static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn signal_handler(_sig: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
+}
+
+/// Log a link-state edge to stderr, ignoring repeats of the last observed state.
+fn handle_link_event(event: LinkEvent, link_up: &mut [Option<bool>], names: &[String]) {
+    let (sock_id, up) = match event {
+        LinkEvent::LinkUp { sock_id } => (sock_id, true),
+        LinkEvent::LinkDown { sock_id } => (sock_id, false),
+    };
+    if link_up[sock_id] == Some(up) {
+        return;
+    }
+    link_up[sock_id] = Some(up);
+    let interface = &names[sock_id];
+    if up {
+        tracing::info!(interface = %interface, "interface link up");
+    } else {
+        tracing::warn!(interface = %interface, "interface link down");
+    }
 }
 
 /// Log CAN traffic from multiple networks.
@@ -96,6 +115,15 @@ fn main() -> ExitCode {
         Ok(total)
     });
 
+    let (event_tx, event_rx) = crossbeam_channel::unbounded::<LinkEvent>();
+    let nl_names = cli.interfaces.clone();
+    let nl_handle = std::thread::spawn(move || netlink::run(&STOP, &nl_names, &event_tx));
+
+    // Names indexed by sock_id, kept for logging link and bus transitions on the main thread.
+    let names = cli.interfaces.clone();
+    // Last observed link state per sock_id, so we log only edges.
+    let mut link_up: Vec<Option<bool>> = vec![None; names.len()];
+
     let formatter = CanutilsFormatter::new(cli.interfaces);
     let header = formatter.header().map(|h| h.to_vec());
     let sink = Sink::new(
@@ -125,6 +153,10 @@ fn main() -> ExitCode {
                 }
                 Err(_) => break,
             },
+            recv(event_rx) -> msg => match msg {
+                Ok(event) => handle_link_event(event, &mut link_up, &names),
+                Err(_) => break,
+            },
             default(Duration::from_millis(100)) => {}
         }
         if let Err(e) = pipeline.tick() {
@@ -146,8 +178,20 @@ fn main() -> ExitCode {
             tracing::error!(error = ?e, "receiver thread failed");
             failed = true;
         }
-        Err(_) => {
-            tracing::error!("receiver thread panicked");
+        Err(e) => {
+            tracing::error!(panic = ?e, "receiver thread panicked");
+            failed = true;
+        }
+    }
+
+    match nl_handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!(error = ?e, "netlink thread failed");
+            failed = true;
+        }
+        Err(e) => {
+            tracing::error!(panic = ?e, "netlink thread panicked");
             failed = true;
         }
     }
@@ -160,6 +204,11 @@ fn main() -> ExitCode {
         }
         batch.clear();
         let _ = empty_tx.try_send(batch);
+    }
+
+    // Log any link transitions the netlink thread queued before it exited.
+    while let Ok(event) = event_rx.try_recv() {
+        handle_link_event(event, &mut link_up, &names);
     }
 
     // close() always runs, even after write errors: for file and zstd writers it is what writes the

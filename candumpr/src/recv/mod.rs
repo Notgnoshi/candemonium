@@ -1,5 +1,6 @@
 #[cfg(any(test, feature = "bench"))]
 pub mod backends;
+pub mod netlink;
 pub mod receiver;
 
 /// Per-frame metadata delivered alongside the CAN frame.
