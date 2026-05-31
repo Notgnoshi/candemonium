@@ -37,16 +37,22 @@ thread.
 ```mermaid
 graph TD
     can0 & can1 & can2 & can3 --> io_uring
+    nl[rtnetlink socket] --> nlthread
 
     subgraph recv [Receiver thread]
         io_uring
     end
 
-    io_uring --> |"SPSC: Vec<CanFrame>"| main_loop
-    main_loop -.-> |"SPSC: recycled Vec"| io_uring
+    subgraph netlink [Netlink thread]
+        nlthread["poll + recvmsg"]
+    end
+
+    io_uring --> |"crossbeam: Vec<CanFrame> incl. error frames"| main_loop
+    main_loop -.-> |"crossbeam: recycled Vec"| io_uring
+    nlthread --> |"crossbeam: LinkEvent"| main_loop
 
     subgraph main [Main thread]
-        main_loop["recv_timeout"]
+        main_loop["select! over frames + link events + tick"]
         main_loop --> |"&[CanFrame]"| Pipeline
     end
 
@@ -121,20 +127,23 @@ receiver allows us to re-use the allocations without repeated high frequency all
 
 ## Main loop detail
 
-The main loop runs on the main thread. It receives batches from the SPSC channel, hands them to the
-Pipeline, and gives the Pipeline a periodic `tick` so its Sinks can check their flush and sync
-timers:
+The main loop uses `crossbeam_channel::select!` over the frame channel, the link-event channel, and
+a 100ms tick deadline. It writes each batch through the Pipeline, derives bus state from the batch's
+error frames, logs link events, and calls `pipeline.tick()` each iteration so Sinks can check their
+flush and sync timers:
 
 ```rust
 send_address_claims(&claim_ifaces)
 
 loop {
-    match full_rx.recv_timeout(100ms) {
-        Ok(batch) => {
+    select! {
+        recv(full_rx) => batch => {
+            log_bus_state(&batch)        // inspect error frames for bus-state transitions
             pipeline.write_batch(&batch)
             recycle(batch)
         }
-        Err(Timeout) => {}
+        recv(event_rx) => link_event => handle_link_event(link_event)
+        default(100ms) => {}
     }
     pipeline.tick()
     if SIGHUP.swap(false) {
@@ -142,8 +151,9 @@ loop {
         send_address_claims(&claim_ifaces)
     }
     send_address_claims(&pipeline.take_rotated())
-    if STOP.load() { pipeline.close(); break }
+    if STOP.load() { break }
 }
+// join the receiver and netlink threads, drain remaining batches, then pipeline.close()
 ```
 
 Each batch represents one CQE drain from the receiver, so the main loop does not need to perform its
@@ -161,7 +171,7 @@ each `sink.write` carries whole formatted frames and that zstd block boundaries 
 frames.
 
 `pipeline.tick()` is called every loop iteration, so it fires under both sustained traffic (after
-each batch) and idle periods (after each 100ms `recv_timeout`).
+each batch) and idle periods (after each 100ms tick deadline).
 
 `pipeline.close()` must run on every shutdown path, even when a preceding `write_batch` returns an
 error. `close` is what calls `writer.finish()` on each Sink, which is where the zstd frame epilogue
@@ -187,6 +197,25 @@ offline analysis.
 * **Size/duration rotation**: rotation triggered internally by the Sink during `write_frame()`. The
   Pipeline tracks which interfaces rotated, and the main loop drains this set via
   `pipeline.take_rotated()` after each drain batch, sending address claims for those interfaces.
+
+## Network state monitoring
+
+candumpr observes two health signals and routes both to the main thread; the receiver stays a
+stateless pump.
+
+**Bus state**: the receive sockets enable `CAN_RAW_ERR_FILTER`, so bus-off, controller-state, and
+restart notifications arrive as ordinary error frames on the frame channel, logged verbatim and
+inspected by the main thread. Reception is unconditional, independent of whether error frames are
+kept in the output.
+
+**Link state**: a dedicated thread binds an `RTMGRP_LINK` socket, dumps initial state with
+`RTM_GETLINK`, and forwards `RTM_NEWLINK`/`RTM_DELLINK` as `LinkEvent`s over a second crossbeam
+channel. It `poll`s with a short timeout to observe shutdown and is otherwise idle, keeping link
+monitoring off the receiver's io_uring frame path at no steady-state cost.
+
+Neither signal is fatal; both are logged to stderr. The two streams are not strictly ordered
+relative to each other. Acting on them (rotate on link-down, flush on bus-off, gate address claims)
+is specified separately.
 
 ## Pipeline detail
 
