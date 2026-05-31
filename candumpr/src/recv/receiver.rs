@@ -178,7 +178,10 @@ impl Receiver {
 
                 if result < 0 {
                     let err_code = -result;
-                    if err_code != libc::ECANCELED && err_code != libc::ENOBUFS {
+                    if err_code != libc::ECANCELED
+                        && err_code != libc::ENOBUFS
+                        && err_code != libc::ENETDOWN
+                    {
                         return Err(std::io::Error::from_raw_os_error(err_code));
                     }
                 } else if let Some(buf_id) = cqueue::buffer_select(flags) {
