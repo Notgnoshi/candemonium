@@ -66,11 +66,10 @@ fn main() -> ExitCode {
             .expect("recycle channel must accept initial pool");
     }
 
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            signal_handler as *const () as libc::sighandler_t,
-        );
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        unsafe {
+            libc::signal(sig, signal_handler as *const () as libc::sighandler_t);
+        }
     }
 
     let recv_handle = std::thread::spawn(move || -> eyre::Result<u64> {
