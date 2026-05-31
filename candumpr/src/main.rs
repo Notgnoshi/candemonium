@@ -1,3 +1,4 @@
+use std::os::unix::io::AsFd;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -62,6 +63,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    for (name, sock) in cli.interfaces.iter().zip(&sockets) {
+        match can::get_recv_buffer(sock.as_fd()) {
+            Ok(bytes) => {
+                tracing::info!(interface = %name, rcvbuf_bytes = bytes, "opened CAN socket")
+            }
+            Err(e) => tracing::warn!(interface = %name, error = ?e, "failed to query rcvbuf size"),
+        }
+    }
 
     const POOL_SIZE: usize = 4;
     const RECYCLE_BOUND: usize = 8;

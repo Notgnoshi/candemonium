@@ -106,6 +106,27 @@ pub fn set_recv_buffer(fd: BorrowedFd<'_>, bytes: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Get the kernel receive buffer size for the socket, in bytes.
+///
+/// The kernel reports the doubled value it actually allocated (see [set_recv_buffer]).
+pub fn get_recv_buffer(fd: BorrowedFd<'_>) -> std::io::Result<u32> {
+    let mut val: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::from_mut(&mut val).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(val as u32)
+}
+
 /// Enable receive timestamping on the socket.
 ///
 /// Requests hardware timestamps with a software fallback. The kernel delivers
