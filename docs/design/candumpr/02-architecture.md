@@ -42,11 +42,12 @@ graph TD
         io_uring
     end
 
-    io_uring --> |"SPSC (unbounded)"| main_loop
+    io_uring --> |"SPSC: Vec<CanFrame>"| main_loop
+    main_loop -.-> |"SPSC: recycled Vec"| io_uring
 
     subgraph main [Main thread]
-        main_loop["recv_timeout / try_recv drain loop"]
-        main_loop --> |CanFrame| Pipeline
+        main_loop["recv_timeout"]
+        main_loop --> |"&[CanFrame]"| Pipeline
     end
 
     subgraph Pipeline
@@ -66,7 +67,7 @@ graph TD
         direction LR
         compressed["ZstdWriter&lt;FileWriter&gt;"]
         uncompressed["BufWriter&lt;FileWriter&gt;"]
-        live["BufWriter&lt;StdoutWriter&gt;"]
+        live["StdoutWriter"]
     end
 
     sink --> writers
@@ -76,12 +77,12 @@ graph TD
 
 The pipeline has four layers:
 
-| Layer     | Responsibility                                                                                                                                                                                                                                                   |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Main loop | Recv frames from SPSC channel, call `pipeline.write_frame()`, forward SIGHUP via `pipeline.rotate()`, call `pipeline.flush()` on idle timeout, `pipeline.close()` on STOP                                                                                        |
-| Pipeline  | Owns one Formatter and a `Vec<Sink>` whose length is either 1 (single-file mode) or the number of interfaces (per-interface mode). Formats frame into a shared buffer, dispatches bytes to the Sink for `frame.iface_idx`, or to `sinks[0]` in single-file mode. |
-| Sink      | Two-state machine (Pending/Active). Owns filename template, rotation config, retention config, header blob, file index. Handles deferred file creation, rotation decisions, retention cleanup. Constructs the Writer stack on activation.                        |
-| Writers   | Composable, each wraps a generic inner Writer. Trait has `write`, `flush`, and `finish`. Leaf implementations are FileWriter and StdoutWriter.                                                                                                                   |
+| Layer     | Responsibility                                                                                                                                                                                                                                                             |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Main loop | Recv batches from SPSC channel, call `pipeline.write_batch()`, recycle the batch Vec back to the receiver, call `pipeline.tick()` each iteration for time-driven flush/sync, forward SIGHUP via `pipeline.rotate()`, `pipeline.close()` on STOP                            |
+| Pipeline  | Owns one Formatter and a `Vec<Sink>` whose length is either 1 (single-file mode) or the number of interfaces (per-interface mode). Formats each frame into a per-Sink scratch buffer, then writes each non-empty buffer to its Sink once per batch.                        |
+| Sink      | Three-state machine (Pending/Active/Closed). Owns filename template, rotation config, retention config, header blob, file index. Handles deferred file creation, rotation decisions, retention cleanup. Constructs the Writer stack on activation. Terminal after `close`. |
+| Writers   | Composable, each wraps a generic inner Writer. Trait has `write`, `flush`, `sync`, and `finish`. Leaf implementations are FileWriter and StdoutWriter.                                                                                                                     |
 
 ## Receiver detail
 
@@ -106,25 +107,36 @@ infinitely increase the batch size - there's a tipping point at which if we incr
 run the risk of filling up the recvbuf. A batch size of 32 or 64 seems like a reasonable upper
 limit.
 
+## Batching CanFrames
+
+Sending the `CanFrame`s in batches over the channel allows the writer to format and write the whole
+batch at once, which is a nice property. Using a second channel to send emptied `Vec`s back to the
+receiver allows us to re-use the allocations without repeated high frequency alloc/free cycles.
+
+* At startup, a small pool of pre-allocated Vecs is pushed into the recycle channel.
+* The receiver pulls a Vec from the recycle channel via `try_recv` and falls back to a fresh
+  allocation if the pool is empty.
+* The main loop receives a batch, hands it to the Pipeline, clears the Vec and `try_send`s it back
+  to the recycle channel. If the recycle channel is full, the Vec is dropped.
+
 ## Main loop detail
 
-The main loop runs on the main thread. It receives frames from the SPSC channel and hands them to
-the Pipeline. The loop drains all ready frames, relying on a byte threshold inside the Sink to
-trigger flushes during normal operation:
+The main loop runs on the main thread. It receives batches from the SPSC channel, hands them to the
+Pipeline, and gives the Pipeline a periodic `tick` so its Sinks can check their flush and sync
+timers:
 
 ```rust
 send_address_claims(&claim_ifaces)
 
 loop {
-    match rx.recv_timeout(100ms) {
-        Ok(frame) => {
-            pipeline.write_frame(&frame)
-            while let Ok(frame) = rx.try_recv() {
-                pipeline.write_frame(&frame)
-            }
+    match full_rx.recv_timeout(100ms) {
+        Ok(batch) => {
+            pipeline.write_batch(&batch)
+            recycle(batch)
         }
-        Err(Timeout) => pipeline.flush()
+        Err(Timeout) => {}
     }
+    pipeline.tick()
     if SIGHUP.swap(false) {
         pipeline.rotate()
         send_address_claims(&claim_ifaces)
@@ -134,17 +146,26 @@ loop {
 }
 ```
 
-The `try_recv` drain terminates because the receiver produces frames at a finite rate bounded by the
-CAN bus speeds.
+Each batch represents one CQE drain from the receiver, so the main loop does not need to perform its
+own draining: a batch already coalesces frames that were ready together.
 
-Flushing is driven by a byte threshold inside the Sink, not by the drain loop. Each `write_frame`
-call tracks bytes written since the last flush. When the threshold is crossed, the Sink calls
-`writer.flush()` inline during the write. This produces predictable flush granularity regardless of
-traffic burstiness. `flush()` is unconditional at each layer of the Writer stack: the Sink is the
-single place that decides when to call it.
+There are three independent triggers for pushing data down the Writer stack, all checked inside the
+Sink:
 
-The 100ms `recv_timeout` is a safety net for idle periods: when no frames arrive, the timeout fires
-and `pipeline.flush()` pushes out whatever is buffered. Under normal load this timeout rarely fires.
+* **Byte threshold crossed during write** triggers `writer.flush()` immediately after the write.
+* **flush_interval elapsed** triggers `writer.flush()` on the next `tick`.
+* **sync_interval elapsed** triggers `writer.sync()` on the next `tick`.
+
+`flush` and `sync` are only invoked between frames, never mid-write, preserving the invariant that
+each `sink.write` carries whole formatted frames and that zstd block boundaries always fall between
+frames.
+
+`pipeline.tick()` is called every loop iteration, so it fires under both sustained traffic (after
+each batch) and idle periods (after each 100ms `recv_timeout`).
+
+`pipeline.close()` must run on every shutdown path, even when a preceding `write_batch` returns an
+error. `close` is what calls `writer.finish()` on each Sink, which is where the zstd frame epilogue
+is emitted and the file is fsynced. Skipping it would leave files in an unrecoverable state.
 
 Signal handling is cooperative: the main loop checks atomic flags between iterations. SIGHUP
 triggers rotation. SIGTERM/SIGINT trigger shutdown. Neither is latency-sensitive since finishing the
@@ -169,23 +190,29 @@ offline analysis.
 
 ## Pipeline detail
 
-The Pipeline owns a single Formatter and a `Vec<Sink>`.
+The Pipeline owns a single Formatter, a `Vec<Sink>`, and one scratch format buffer per Sink.
 
 When the output path template contains `{interface}`, `sinks.len() == n_interfaces` and frames are
 dispatched by `frame.iface_idx`. Otherwise, `sinks.len() == 1`, all traffic is interleaved into that
 single Sink, and `frame.iface_idx` is used only by the Formatter (for the interface-name column in
 formats that need it), not for dispatch.
 
-On `write_frame(&CanFrame)`:
+On `write_batch(&[CanFrame])`:
 
-1. Format the frame into a shared `Vec<u8>` buffer using the Formatter
-2. Dispatch the formatted bytes to the target Sink: `sinks[frame.iface_idx]` in per-interface mode,
-   or `sinks[0]` in single-file mode
+1. Clear each Sink's scratch buffer.
+2. For each frame in the batch, format it into the buffer of its target Sink: `sinks[iface_idx]` in
+   per-interface mode, or `sinks[0]` in single-file mode.
+3. For each Sink with a non-empty buffer, call `sink.write(buf)` exactly once.
 
-On `flush()`, `rotate()`, and `close()`: forward to all unique Sinks.
+This collapses every frame in the batch destined for a given Sink into a single `sink.write` call,
+preserving the invariant that each `sink.write` carries whole formatted frames. In single-sink mode
+that is one write per batch; in per-interface mode, one write per (interface, batch) pair.
+
+On `tick()`: forward to each Sink so it can check its `flush_interval` and `sync_interval` timers
+and call `writer.flush()` / `writer.sync()` if the corresponding timer has elapsed.
 
 On `take_rotated()`: return and clear the set of interface indices whose Sinks rotated during
-`write_frame()`. This allows the main loop to send address claim requests for interfaces that
+`write_batch()`. This allows the main loop to send address claim requests for interfaces that
 rotated due to size or duration limits.
 
 ## Formatter detail
@@ -206,7 +233,7 @@ Output formats: can-utils candump (file and console variants), Vector ASC, PCAP.
 
 ## Sink detail
 
-The Sink is a two-state machine that manages one output destination.
+The Sink is a three-state machine that manages one output destination.
 
 ```mermaid
 stateDiagram-v2
@@ -214,8 +241,9 @@ stateDiagram-v2
     Pending --> Active : first write (resolve filename, open file, write header)
     Active --> Active : write (within rotation threshold)
     Active --> Pending : rotate (size/time limit hit, or SIGHUP)
-    Active --> [*] : close (finalize, fsync)
-    Pending --> [*] : close (no-op)
+    Active --> Closed : close (finalize, fsync)
+    Pending --> Closed : close (no-op)
+    Closed --> [*]
 ```
 
 ### Pending state
@@ -227,7 +255,9 @@ Holds all configuration needed to open a new file:
 * Rotation config (size limit or duration limit, or none)
 * Retention config (size limit, or none)
 * Compression config (on/off)
-* Flush byte threshold (drives how often the Sink calls `writer.flush()` during normal writes)
+* Flush byte threshold (caps the size of one in-flight zstd block / one BufWriter fill)
+* Flush interval (upper bound on time between `writer.flush()` calls; optional)
+* Sync interval (upper bound on time between `writer.sync()` calls; optional)
 * Header blob from the Formatter
 
 ### Active state
@@ -241,6 +271,14 @@ Adds the live output state:
   Sink queries it after each write.
 * File open instant from the monotonic clock (for duration-based rotation tracking)
 * Current filename (for logging rotation events to stderr)
+
+### Closed state
+
+Terminal state. Reached by `close`, which calls `writer.finish()` if the Sink was Active (flushing
+buffers, writing the zstd frame epilogue if compressed, fsyncing the file) or no-ops if the Sink was
+Pending. A Closed Sink does not accept further writes: subsequent `write` calls return an error
+rather than re-opening the file. `flush`, `rotate`, and `close` on an already-Closed Sink are
+no-ops.
 
 ### Deferred file creation
 
@@ -300,12 +338,15 @@ Writers are composable. Each Writer wraps an inner Writer, forming a stack. The 
 Writer:
     write(&mut self, buf: &[u8]) -> Result<()>
     flush(&mut self) -> Result<()>
+    sync(&mut self) -> Result<()>
     finish(&mut self) -> Result<()>
 ```
 
-* `write` -- push bytes through to the inner Writer (possibly buffering or transforming)
-* `flush` -- flush internal buffers so data is recoverable up to this point
-* `finish` -- finalize the stream (called on rotation and shutdown only)
+* `write` -- push bytes through to the inner Writer (possibly buffering or transforming).
+* `flush` -- push buffered bytes down into the kernel page cache. Does not force a disk commit.
+* `sync` -- push buffered bytes down and durably commit them to storage.
+* `finish` -- write any per-stream epilogue (e.g. the zstd frame trailer), then durably commit.
+  Called on rotation and shutdown only.
 
 ### Writer implementations
 
@@ -313,18 +354,21 @@ Writer:
 
 * `write`: `fd.write(buf)`
 * `flush`: no-op (data is in the kernel page cache)
-* `finish`: `fsync`
+* `sync`: `fdatasync` (commit data + size to disk, skip the inode-only metadata)
+* `finish`: `fsync` (commit data + all metadata to disk)
 
 **StdoutWriter** (leaf): writes to stdout, flushes eagerly for live viewing.
 
 * `write`: `stdout.write(buf)` then `stdout.flush()`
 * `flush`: no-op (already flushed on every write)
+* `sync`: no-op
 * `finish`: no-op
 
 **BufWriter\<W: Writer\>**: buffers small writes into larger ones.
 
 * `write`: buffer bytes, flush to inner Writer when buffer is full
 * `flush`: flush buffer to inner Writer, call `inner.flush()`
+* `sync`: flush buffer to inner Writer, call `inner.sync()`
 * `finish`: flush buffer to inner Writer, call `inner.finish()`
 
 **ZstdWriter\<W: Writer\>**: compresses data with zstd streaming compression.
@@ -333,6 +377,8 @@ Writer:
 * `flush`: call `ZSTD_e_flush` to emit a complete compressed block to the inner Writer, then call
   `inner.flush()`. The Sink's flush byte threshold gates how often this runs during normal writes,
   so emitting too-small blocks is already avoided at that layer.
+* `sync`: call `ZSTD_e_flush` to emit a complete compressed block, then call `inner.sync()`. The
+  zstd encoder state continues across the call; the file remains an in-progress zstd stream.
 * `finish`: call `ZSTD_e_end` to write the zstd frame epilogue, making the file a complete and
   independently decompressable zstd stream. Then call `inner.finish()`.
 
@@ -342,23 +388,37 @@ Writer:
 | -------------------- | -------------------------- |
 | File, uncompressed   | BufWriter\<FileWriter\>    |
 | File, compressed     | ZstdWriter\<FileWriter\>   |
-| Stdout, uncompressed | BufWriter\<StdoutWriter\>  |
+| Stdout, uncompressed | StdoutWriter               |
 | Stdout, compressed   | ZstdWriter\<StdoutWriter\> |
 
 No BufWriter wraps the ZstdWriter because the zstd encoder already batches output into block-sized
 chunks. The BufWriter is only needed when many small formatted frames (uncompressed) need to be
 batched into fewer `write()` syscalls.
 
-### Flush behavior summary
+We don't buffer writes to stdout because when used interactively, candumpr should be responsive. The
+low-performance-impact goal matters most for the logging-daemon use case, and less for interactive
+troubleshooting.
 
-Both "Sink byte threshold crossed during write" and "idle-timeout `pipeline.flush()`" ultimately
-call `writer.flush()` with the same semantics. The Sink is the only place that decides when to call
-`flush`; everything below it responds unconditionally.
+### Flush behavior
 
-| Event                           | ZstdWriter            | BufWriter             | FileWriter | StdoutWriter          |
-| ------------------------------- | --------------------- | --------------------- | ---------- | --------------------- |
-| `flush` (byte threshold / idle) | ZSTD_e_flush          | Flush buffer to inner | No-op      | No-op (already eager) |
-| `finish` (rotation / shutdown)  | ZSTD_e_end (epilogue) | Flush buffer to inner | fsync      | No-op                 |
+The Sink is the only place that decides when to call `flush`, `sync`, or `finish`; everything below
+it responds unconditionally and forwards the call down its inner stack.
+
+| Event                                      | ZstdWriter                   | BufWriter                     | FileWriter | StdoutWriter |
+| ------------------------------------------ | ---------------------------- | ----------------------------- | ---------- | ------------ |
+| `flush` (byte threshold or flush_interval) | ZSTD_e_flush + `inner.flush` | Flush buffer + `inner.flush`  | No-op      | No-op        |
+| `sync` (sync_interval)                     | ZSTD_e_flush + `inner.sync`  | Flush buffer + `inner.sync`   | fdatasync  | No-op        |
+| `finish` (rotation / shutdown)             | ZSTD_e_end + `inner.finish`  | Flush buffer + `inner.finish` | fsync      | No-op        |
+
+## Durability
+
+Two distinct guarantees:
+
+* **Structurally readable on power loss.** `flush` and `sync` only ever fire between frames, so
+  whatever the kernel had written back at the moment of power loss truncates on a block and frame
+  boundary. The file is always decodable up to that point with standard tools.
+* **No data lost.** Only `sync` (and `finish`) provide this. Data that has been `flush`ed but not
+  `sync`ed lives in the kernel page cache and may not reach disk before power loss.
 
 ## Compression detail
 

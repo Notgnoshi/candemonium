@@ -6,6 +6,13 @@ use crate::frame::CanFrame;
 pub trait Formatter {
     /// Append the formatted representation of `frame` to `buf`.
     fn format(&self, frame: &CanFrame, buf: &mut Vec<u8>);
+
+    /// Optional header bytes written once at the start of each output stream, before any frames.
+    ///
+    /// Used by formats with a file-level header (e.g. PCAP).
+    fn header(&self) -> Option<&[u8]> {
+        None
+    }
 }
 
 /// Formats frames in the can-utils candump file format.

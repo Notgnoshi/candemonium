@@ -1,11 +1,14 @@
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use candumpr::can;
 use candumpr::format::{CanutilsFormatter, Formatter};
-use candumpr::recv::receiver::Receiver;
-use candumpr::write::{StdoutWriter, Writer};
+use candumpr::pipeline::Pipeline;
+use candumpr::recv::receiver::{BATCH_CAPACITY, Receiver};
+use candumpr::sink::Sink;
+use candumpr::writer::StdoutWriter;
 use clap::Parser;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -27,8 +30,11 @@ struct Cli {
     log_level: tracing::Level,
 }
 
-fn main() -> eyre::Result<()> {
-    color_eyre::install()?;
+fn main() -> ExitCode {
+    if let Err(e) = color_eyre::install() {
+        eprintln!("failed to install error handler: {e:#}");
+        return ExitCode::FAILURE;
+    }
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
@@ -36,57 +42,110 @@ fn main() -> eyre::Result<()> {
         .with_max_level(cli.log_level)
         .init();
 
-    let sockets: Vec<_> = cli
+    let sockets: Vec<_> = match cli
         .interfaces
         .iter()
         .map(|name| can::open_can_raw(name))
-        .collect::<std::io::Result<_>>()?;
+        .collect::<std::io::Result<_>>()
+    {
+        Ok(sockets) => sockets,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to open CAN sockets");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    let (tx, rx) = mpsc::channel();
+    const POOL_SIZE: usize = 4;
+    const RECYCLE_BOUND: usize = 8;
 
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            signal_handler as *const () as libc::sighandler_t,
-        );
+    let (full_tx, full_rx) = mpsc::channel::<Vec<_>>();
+    let (empty_tx, empty_rx) = mpsc::sync_channel::<Vec<_>>(RECYCLE_BOUND);
+    for _ in 0..POOL_SIZE {
+        empty_tx
+            .send(Vec::with_capacity(BATCH_CAPACITY))
+            .expect("recycle channel must accept initial pool");
+    }
+
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        unsafe {
+            libc::signal(sig, signal_handler as *const () as libc::sighandler_t);
+        }
     }
 
     let recv_handle = std::thread::spawn(move || -> eyre::Result<u64> {
         let mut recv = Receiver::new(sockets)?;
-        let total = recv.run(&STOP, &tx)?;
+        let total = recv.run(&STOP, &full_tx, &empty_rx)?;
         Ok(total)
     });
 
     let formatter = CanutilsFormatter::new(cli.interfaces);
-    let mut writer = StdoutWriter::new();
-    let mut buf = Vec::with_capacity(4096);
+    let header = formatter.header().map(|h| h.to_vec());
+    let sink = Sink::new(
+        StdoutWriter::new(),
+        header,
+        64 * 1024,
+        Some(Duration::from_secs(5)),
+        Some(Duration::from_secs(5 * 60)),
+    );
+    let mut pipeline = Pipeline::new(formatter, vec![sink]);
+
+    // Write-path errors are logged and recorded rather than propagated: returning early would skip
+    // draining the remaining batches and closing the pipeline, both of which can lose buffered data.
+    // Every error sets `failed` so the process still exits nonzero.
+    let mut failed = false;
 
     while !STOP.load(Ordering::Relaxed) {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(frame) => {
-                formatter.format(&frame, &mut buf);
-                // Drain any additional frames that are immediately ready.
-                while let Ok(frame) = rx.try_recv() {
-                    formatter.format(&frame, &mut buf);
+        match full_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(mut batch) => {
+                if let Err(e) = pipeline.write_batch(&batch) {
+                    tracing::error!(error = ?e, "failed to write batch");
+                    failed = true;
                 }
-                writer.write(&buf)?;
-                buf.clear();
+                batch.clear();
+                let _ = empty_tx.try_send(batch);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if let Err(e) = pipeline.tick() {
+            tracing::error!(error = ?e, "periodic flush or sync failed");
+            failed = true;
         }
     }
 
-    // Drain remaining frames after stop.
-    while let Ok(frame) = rx.try_recv() {
-        formatter.format(&frame, &mut buf);
-    }
-    if !buf.is_empty() {
-        writer.write(&buf)?;
+    // Join before draining so we write every received frame.
+    match recv_handle.join() {
+        Ok(Ok(total)) => tracing::debug!(total_frames = total, "receiver finished"),
+        Ok(Err(e)) => {
+            tracing::error!(error = ?e, "receiver thread failed");
+            failed = true;
+        }
+        Err(_) => {
+            tracing::error!("receiver thread panicked");
+            failed = true;
+        }
     }
 
-    let total = recv_handle.join().expect("receiver thread panicked")?;
-    tracing::debug!(total, "receiver finished");
+    // Drain everything the receiver queued before it exited.
+    while let Ok(mut batch) = full_rx.try_recv() {
+        if let Err(e) = pipeline.write_batch(&batch) {
+            tracing::error!(error = ?e, "failed to write batch during drain");
+            failed = true;
+        }
+        batch.clear();
+        let _ = empty_tx.try_send(batch);
+    }
 
-    Ok(())
+    // close() always runs, even after write errors: for file and zstd writers it is what writes the
+    // epilogue and fsyncs, so skipping it could leave output unrecoverable.
+    if let Err(e) = pipeline.close() {
+        tracing::error!(error = ?e, "failed to close pipeline");
+        failed = true;
+    }
+
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
