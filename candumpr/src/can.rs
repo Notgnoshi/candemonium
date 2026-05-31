@@ -83,6 +83,20 @@ fn open_can_socket(ifname: &str, flags: i32) -> std::io::Result<OwnedFd> {
         return Err(std::io::Error::last_os_error());
     }
 
+    let err_mask = libc::CAN_ERR_MASK;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_CAN_RAW,
+            libc::CAN_RAW_ERR_FILTER,
+            std::ptr::from_ref(&err_mask).cast::<libc::c_void>(),
+            std::mem::size_of_val(&err_mask) as u32,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
     Ok(fd)
 }
 
@@ -104,6 +118,27 @@ pub fn set_recv_buffer(fd: BorrowedFd<'_>, bytes: u32) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Get the kernel receive buffer size for the socket, in bytes.
+///
+/// The kernel reports the doubled value it actually allocated (see [set_recv_buffer]).
+pub fn get_recv_buffer(fd: BorrowedFd<'_>) -> std::io::Result<u32> {
+    let mut val: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::from_mut(&mut val).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(val as u32)
 }
 
 /// Enable receive timestamping on the socket.
