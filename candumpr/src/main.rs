@@ -113,7 +113,20 @@ fn main() -> ExitCode {
         }
     }
 
-    // Drain whatever is still queued after the stop signal.
+    // Join before draining so we write every received frame.
+    match recv_handle.join() {
+        Ok(Ok(total)) => tracing::debug!(total_frames = total, "receiver finished"),
+        Ok(Err(e)) => {
+            tracing::error!(error = ?e, "receiver thread failed");
+            failed = true;
+        }
+        Err(_) => {
+            tracing::error!("receiver thread panicked");
+            failed = true;
+        }
+    }
+
+    // Drain everything the receiver queued before it exited.
     while let Ok(mut batch) = full_rx.try_recv() {
         if let Err(e) = pipeline.write_batch(&batch) {
             tracing::error!(error = ?e, "failed to write batch during drain");
@@ -128,18 +141,6 @@ fn main() -> ExitCode {
     if let Err(e) = pipeline.close() {
         tracing::error!(error = ?e, "failed to close pipeline");
         failed = true;
-    }
-
-    match recv_handle.join() {
-        Ok(Ok(total)) => tracing::debug!(total_frames = total, "receiver finished"),
-        Ok(Err(e)) => {
-            tracing::error!(error = ?e, "receiver thread failed");
-            failed = true;
-        }
-        Err(_) => {
-            tracing::error!("receiver thread panicked");
-            failed = true;
-        }
     }
 
     if failed {
