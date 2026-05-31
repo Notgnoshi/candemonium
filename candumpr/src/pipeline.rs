@@ -31,7 +31,7 @@ impl<F: Formatter> Pipeline<F> {
     /// Write the given batch of [CanFrame]s to the [Sink]s
     ///
     /// With a single sink, every frame is routed to it regardless of interface index; this is both
-    /// the common stdout case and what keeps a frame's [CanFrame::iface_idx] from indexing past the
+    /// the common stdout case and what keeps a frame's [CanFrame::sock_id] from indexing past the
     /// only buffer. With multiple sinks, frames are dispatched by interface index.
     pub fn write_batch(&mut self, frames: &[CanFrame]) -> eyre::Result<()> {
         for buf in &mut self.bufs {
@@ -43,7 +43,7 @@ impl<F: Formatter> Pipeline<F> {
 
         let single = self.sinks.len() == 1;
         for frame in frames {
-            let idx = if single { 0 } else { frame.iface_idx };
+            let idx = if single { 0 } else { frame.sock_id };
             if self.first_ts[idx].is_none() {
                 self.first_ts[idx] = Some(frame.timestamp);
             }
@@ -114,11 +114,11 @@ mod tests {
     use crate::sink::Sink;
     use crate::test_util::TestBufWriter;
 
-    fn frame(iface_idx: usize, id: u32, data: &[u8]) -> CanFrame {
+    fn frame(sock_id: usize, id: u32, data: &[u8]) -> CanFrame {
         CanFrame {
-            iface_idx,
+            sock_id,
             timestamp: Timestamp {
-                sec: 1000 + iface_idx as i64,
+                sec: 1000 + sock_id as i64,
                 nsec: 0,
             },
             direction: Direction::Rx,
@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn per_interface_dispatches_by_iface_idx() {
+    fn per_interface_dispatches_by_sock_id() {
         let names = vec!["can0".to_string(), "can1".to_string(), "can2".to_string()];
         let sinks = vec![sink(), sink(), sink()];
         let mut pipeline = Pipeline::new(CanutilsFormatter::new(names.clone()), sinks);

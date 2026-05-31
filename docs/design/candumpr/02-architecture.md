@@ -57,7 +57,7 @@ graph TD
     end
 
     subgraph Pipeline
-        Formatter --> |"&[u8]"| dispatch["sinks[frame.iface_idx]"]
+        Formatter --> |"&[u8]"| dispatch["sinks[frame.sock_id]"]
     end
 
     subgraph sink [Sink]
@@ -222,14 +222,14 @@ is specified separately.
 The Pipeline owns a single Formatter, a `Vec<Sink>`, and one scratch format buffer per Sink.
 
 When the output path template contains `{interface}`, `sinks.len() == n_interfaces` and frames are
-dispatched by `frame.iface_idx`. Otherwise, `sinks.len() == 1`, all traffic is interleaved into that
-single Sink, and `frame.iface_idx` is used only by the Formatter (for the interface-name column in
+dispatched by `frame.sock_id`. Otherwise, `sinks.len() == 1`, all traffic is interleaved into that
+single Sink, and `frame.sock_id` is used only by the Formatter (for the interface-name column in
 formats that need it), not for dispatch.
 
 On `write_batch(&[CanFrame])`:
 
 1. Clear each Sink's scratch buffer.
-2. For each frame in the batch, format it into the buffer of its target Sink: `sinks[iface_idx]` in
+2. For each frame in the batch, format it into the buffer of its target Sink: `sinks[sock_id]` in
    per-interface mode, or `sinks[0]` in single-file mode.
 3. For each Sink with a non-empty buffer, call `sink.write(buf)` exactly once.
 

@@ -33,7 +33,7 @@ impl CanutilsFormatter {
 impl Formatter for CanutilsFormatter {
     fn format(&self, frame: &CanFrame, buf: &mut Vec<u8>) {
         let ts = &frame.timestamp;
-        let iface = &self.iface_names[frame.iface_idx];
+        let iface = &self.iface_names[frame.sock_id];
         let id = frame.raw.can_id & !libc::CAN_EFF_FLAG & !libc::CAN_RTR_FLAG & !libc::CAN_ERR_FLAG;
 
         write!(
@@ -64,7 +64,7 @@ mod tests {
     #[test]
     fn canutils_format_basic() {
         let frame = CanFrame {
-            iface_idx: 0,
+            sock_id: 0,
             timestamp: Timestamp {
                 sec: 1616161616,
                 nsec: 123000,
@@ -85,7 +85,7 @@ mod tests {
     #[test]
     fn canutils_format_empty_data() {
         let frame = CanFrame {
-            iface_idx: 1,
+            sock_id: 1,
             timestamp: Timestamp { sec: 0, nsec: 0 },
             direction: Direction::Rx,
             raw: LinuxCanFrame::new(0x123 | libc::CAN_EFF_FLAG, &[]),

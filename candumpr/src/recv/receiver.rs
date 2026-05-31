@@ -196,7 +196,7 @@ impl Receiver {
                             let timestamp = meta.timestamp.unwrap_or(Timestamp { sec: 0, nsec: 0 });
 
                             batch.push(CanFrame {
-                                iface_idx: idx,
+                                sock_id: idx,
                                 timestamp,
                                 direction: Direction::Rx,
                                 raw,
@@ -368,7 +368,7 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_millis(100))
                 .unwrap();
             for frame in &batch {
-                assert!(frame.iface_idx < IFACE_COUNT);
+                assert!(frame.sock_id < IFACE_COUNT);
                 assert_eq!(frame.direction, Direction::Rx);
                 assert!(frame.raw.len <= 8);
                 count += 1;

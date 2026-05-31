@@ -42,6 +42,14 @@ fn main() -> ExitCode {
         .with_max_level(cli.log_level)
         .init();
 
+    // The sockets vector defines the canonical interface ordering. The orderings of:
+    //
+    // 1. cli.interfaces
+    // 2. sockets
+    // 3. Pipeline::sinks / bufs
+    // 4. et al.
+    //
+    // all follow the same ordering, and are all indexed by CanFrame::sock_id
     let sockets: Vec<_> = match cli
         .interfaces
         .iter()
