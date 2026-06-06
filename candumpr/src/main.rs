@@ -157,7 +157,10 @@ fn main() -> ExitCode {
     // Last logged bus state per sock_id, so we log only transitions.
     let mut bus_state: Vec<BusState> = vec![BusState::default(); names.len()];
 
-    let formatter = CanutilsFileFormatter::new(cli.interfaces, TimestampMode::Absolute);
+    let formatter: Box<dyn Formatter> = Box::new(CanutilsFileFormatter::new(
+        cli.interfaces,
+        TimestampMode::Absolute,
+    ));
     let header = formatter.header().map(|h| h.to_vec());
     let sink = Sink::new(
         StdoutWriter::new(),

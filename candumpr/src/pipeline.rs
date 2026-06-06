@@ -4,18 +4,18 @@ use crate::recv::Timestamp;
 use crate::sink::Sink;
 
 /// Orchestrates formatting batches of [CanFrame]s and then writing them to each [Sink]
-pub struct Pipeline<F: Formatter> {
-    formatter: F,
+pub struct Pipeline {
+    formatter: Box<dyn Formatter>,
     pub(crate) sinks: Vec<Sink>,
     bufs: Vec<Vec<u8>>,
     first_ts: Vec<Option<Timestamp>>,
 }
 
-impl<F: Formatter> Pipeline<F> {
+impl Pipeline {
     /// Construct a Pipeline over a non-empty set of sinks.
     ///
     /// There should either be one sink, or a sink for every CAN interface being logged.
-    pub fn new(formatter: F, sinks: Vec<Sink>) -> Self {
+    pub fn new(formatter: Box<dyn Formatter>, sinks: Vec<Sink>) -> Self {
         assert!(!sinks.is_empty(), "Pipeline requires at least one Sink");
         let n = sinks.len();
         let bufs = (0..n).map(|_| Vec::with_capacity(4096)).collect();
@@ -157,7 +157,10 @@ mod tests {
             "can3".to_string(),
         ];
         let mut pipeline = Pipeline::new(
-            CanutilsFileFormatter::new(names.clone(), TimestampMode::Absolute),
+            Box::new(CanutilsFileFormatter::new(
+                names.clone(),
+                TimestampMode::Absolute,
+            )),
             vec![sink()],
         );
 
@@ -173,7 +176,10 @@ mod tests {
         let names = vec!["can0".to_string(), "can1".to_string(), "can2".to_string()];
         let sinks = vec![sink(), sink(), sink()];
         let mut pipeline = Pipeline::new(
-            CanutilsFileFormatter::new(names.clone(), TimestampMode::Absolute),
+            Box::new(CanutilsFileFormatter::new(
+                names.clone(),
+                TimestampMode::Absolute,
+            )),
             sinks,
         );
 
