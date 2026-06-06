@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::time::Duration;
 
+use crate::errframe::ErrorFrame;
 use crate::frame::CanFrame;
 use crate::recv::Timestamp;
 
@@ -144,6 +145,48 @@ impl Formatter for CanutilsFileFormatter {
         write!(buf, "{iface} {id:0width$X}#").unwrap();
         for i in 0..frame.raw.len as usize {
             write!(buf, "{:02X}", frame.raw.data[i]).unwrap();
+        }
+        buf.push(b'\n');
+    }
+}
+
+/// Formats frames in a human-readable, candump-console-derived format.
+///
+/// We try to match can-utils console format, but I'm not going to try to reproduce every quirk of
+/// its spacing.
+///
+/// Output format: `(TIMESTAMP) IFACE CANID [LEN] B0 B1 ...`, e.g.
+/// `(1616161616.123456) can0 18FECA00 [4] AA BB 00 11`.
+///
+/// Error frames append `ERRORFRAME` and a decoded description on the following, tab-indented line.
+pub struct CanutilsConsoleFormatter {
+    iface_names: Vec<String>,
+    clock: TimestampClock,
+}
+
+impl CanutilsConsoleFormatter {
+    pub fn new(iface_names: Vec<String>, timestamp: TimestampMode) -> Self {
+        Self {
+            iface_names,
+            clock: TimestampClock::new(timestamp),
+        }
+    }
+}
+
+impl Formatter for CanutilsConsoleFormatter {
+    fn format(&mut self, frame: &CanFrame, buf: &mut Vec<u8>) {
+        let display = self.clock.resolve(frame.timestamp);
+        write_timestamp(buf, display);
+
+        let iface = &self.iface_names[frame.sock_id];
+        let (id, width) = canid_and_width(frame.raw.can_id);
+        let len = frame.raw.len as usize;
+        write!(buf, "{iface} {id:0width$X} [{len}]").unwrap();
+        for i in 0..len {
+            write!(buf, " {:02X}", frame.raw.data[i]).unwrap();
+        }
+        if let Some(err) = ErrorFrame::parse(&frame.raw) {
+            write!(buf, " ERRORFRAME\n\t{err}").unwrap();
         }
         buf.push(b'\n');
     }
@@ -305,6 +348,63 @@ mod tests {
         assert_eq!(
             clock.resolve(ts(99, 0)),
             DisplayTimestamp::Relative(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn console_format_standard_data_frame() {
+        let mut fmt =
+            CanutilsConsoleFormatter::new(vec!["can0".to_string()], TimestampMode::Absolute);
+        let mut buf = Vec::new();
+        fmt.format(
+            &frame(0, ts(1, 0), 0x123, &[0xDE, 0xAD, 0xBE, 0xEF]),
+            &mut buf,
+        );
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "(1.000000) can0 123 [4] DE AD BE EF\n"
+        );
+    }
+
+    #[test]
+    fn console_format_extended_empty_frame() {
+        let mut fmt =
+            CanutilsConsoleFormatter::new(vec!["can0".to_string()], TimestampMode::Absolute);
+        let mut buf = Vec::new();
+        fmt.format(
+            &frame(0, ts(1, 0), 0x18FECA00 | libc::CAN_EFF_FLAG, &[]),
+            &mut buf,
+        );
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "(1.000000) can0 18FECA00 [0]\n"
+        );
+    }
+
+    #[test]
+    fn console_format_error_frame_decodes_to_human_text() {
+        let mut fmt =
+            CanutilsConsoleFormatter::new(vec!["can0".to_string()], TimestampMode::Absolute);
+        let mut buf = Vec::new();
+        fmt.format(
+            &frame(0, ts(1, 0), libc::CAN_ERR_FLAG | 0x40, &[0; 8]),
+            &mut buf,
+        );
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "(1.000000) can0 20000040 [8] 00 00 00 00 00 00 00 00 ERRORFRAME\n\tbus-off\n"
+        );
+    }
+
+    #[test]
+    fn console_format_delta_timestamps() {
+        let mut fmt = CanutilsConsoleFormatter::new(vec!["can0".to_string()], TimestampMode::Delta);
+        let mut buf = Vec::new();
+        fmt.format(&frame(0, ts(100, 0), 0x123, &[0xAB]), &mut buf);
+        fmt.format(&frame(0, ts(100, 250_000_000), 0x123, &[0xAB]), &mut buf);
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "(000.000000) can0 123 [1] AB\n(000.250000) can0 123 [1] AB\n"
         );
     }
 }
