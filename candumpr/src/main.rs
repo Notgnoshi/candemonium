@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use candumpr::can;
 use candumpr::errframe::{BusState, ErrorFrame};
-use candumpr::format::{CanutilsFormatter, Formatter};
+use candumpr::format::{CanutilsFileFormatter, Formatter, TimestampMode};
 use candumpr::frame::CanFrame;
 use candumpr::pipeline::Pipeline;
 use candumpr::recv::netlink::{self, LinkEvent};
@@ -157,7 +157,7 @@ fn main() -> ExitCode {
     // Last logged bus state per sock_id, so we log only transitions.
     let mut bus_state: Vec<BusState> = vec![BusState::default(); names.len()];
 
-    let formatter = CanutilsFormatter::new(cli.interfaces);
+    let formatter = CanutilsFileFormatter::new(cli.interfaces, TimestampMode::Absolute);
     let header = formatter.header().map(|h| h.to_vec());
     let sink = Sink::new(
         StdoutWriter::new(),

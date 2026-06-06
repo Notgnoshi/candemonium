@@ -109,7 +109,7 @@ mod tests {
 
     use super::*;
     use crate::can::LinuxCanFrame;
-    use crate::format::CanutilsFormatter;
+    use crate::format::{CanutilsFileFormatter, TimestampMode};
     use crate::frame::Direction;
     use crate::sink::Sink;
     use crate::test_util::TestBufWriter;
@@ -140,7 +140,7 @@ mod tests {
     }
 
     fn formatted(names: &[String], frames: &[&CanFrame]) -> Vec<u8> {
-        let fmt = CanutilsFormatter::new(names.to_vec());
+        let mut fmt = CanutilsFileFormatter::new(names.to_vec(), TimestampMode::Absolute);
         let mut buf = Vec::new();
         for frame in frames {
             fmt.format(frame, &mut buf);
@@ -156,7 +156,10 @@ mod tests {
             "can2".to_string(),
             "can3".to_string(),
         ];
-        let mut pipeline = Pipeline::new(CanutilsFormatter::new(names.clone()), vec![sink()]);
+        let mut pipeline = Pipeline::new(
+            CanutilsFileFormatter::new(names.clone(), TimestampMode::Absolute),
+            vec![sink()],
+        );
 
         let frames = vec![frame(0, 0x100, &[0x01]), frame(3, 0x200, &[0x02])];
         pipeline.write_batch(&frames).unwrap();
@@ -169,7 +172,10 @@ mod tests {
     fn per_interface_dispatches_by_sock_id() {
         let names = vec!["can0".to_string(), "can1".to_string(), "can2".to_string()];
         let sinks = vec![sink(), sink(), sink()];
-        let mut pipeline = Pipeline::new(CanutilsFormatter::new(names.clone()), sinks);
+        let mut pipeline = Pipeline::new(
+            CanutilsFileFormatter::new(names.clone(), TimestampMode::Absolute),
+            sinks,
+        );
 
         let frames = vec![
             frame(0, 0x100, &[0x0A]),
