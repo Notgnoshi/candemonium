@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use candumpr::can;
 use candumpr::errframe::{BusState, ErrorFrame};
-use candumpr::format::{CanutilsFormatter, Formatter};
+use candumpr::format::{CanutilsConsoleFormatter, CanutilsFileFormatter, Formatter, TimestampMode};
 use candumpr::frame::CanFrame;
 use candumpr::pipeline::Pipeline;
 use candumpr::recv::netlink::{self, LinkEvent};
@@ -68,6 +68,15 @@ fn log_error_frames(batch: &[CanFrame], bus_state: &mut [BusState], names: &[Str
     }
 }
 
+/// Output format for received frames.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum Format {
+    /// can-utils candump file format: `(ts) iface ID#DATA`.
+    CandumpFile,
+    /// can-utils candump console format: `(ts) iface ID [len] B0 B1 ...`.
+    CandumpConsole,
+}
+
 /// Log CAN traffic from multiple networks.
 #[derive(Parser)]
 #[command(version)]
@@ -75,6 +84,14 @@ struct Cli {
     /// CAN interfaces to listen on.
     #[arg(required = true)]
     interfaces: Vec<String>,
+
+    /// Output format for received frames.
+    #[arg(long, value_enum, default_value = "candump-file")]
+    format: Format,
+
+    /// Timestamp rendering mode. Only applies to the candump formats.
+    #[arg(long, value_enum, default_value = "absolute")]
+    timestamp: TimestampMode,
 
     /// Log level for tracing output on stderr.
     #[arg(long, default_value = "INFO")]
@@ -157,7 +174,12 @@ fn main() -> ExitCode {
     // Last logged bus state per sock_id, so we log only transitions.
     let mut bus_state: Vec<BusState> = vec![BusState::default(); names.len()];
 
-    let formatter = CanutilsFormatter::new(cli.interfaces);
+    let formatter: Box<dyn Formatter> = match cli.format {
+        Format::CandumpFile => Box::new(CanutilsFileFormatter::new(cli.interfaces, cli.timestamp)),
+        Format::CandumpConsole => {
+            Box::new(CanutilsConsoleFormatter::new(cli.interfaces, cli.timestamp))
+        }
+    };
     let header = formatter.header().map(|h| h.to_vec());
     let sink = Sink::new(
         StdoutWriter::new(),

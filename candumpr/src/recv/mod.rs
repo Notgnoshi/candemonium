@@ -21,7 +21,7 @@ pub struct FrameMeta {
 }
 
 /// A timestamp with seconds and nanoseconds since the Unix epoch.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timestamp {
     pub sec: i64,
     pub nsec: i64,

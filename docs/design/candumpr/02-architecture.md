@@ -246,14 +246,15 @@ rotated due to size or duration limits.
 
 ## Formatter detail
 
-The Formatter converts a CanFrame into a byte array to be written. It is stateless (or nearly so)
-and is owned by the Pipeline, not by individual Sinks. All configuration (interface names, timestamp
-mode, format) is provided at construction time.
+The Formatter converts a CanFrame into a byte array to be written. It is owned by the Pipeline, not
+by individual Sinks, and all configuration (interface names, timestamp mode, format) is provided at
+construction time. Its only mutable state is the relative-timestamp reference used by the delta and
+zero timestamp modes, so `format` takes `&mut self`.
 
 The Formatter trait has two methods:
 
-* `format(&self, frame: &CanFrame, buf: &mut Vec<u8>)` -- append the formatted frame to the buffer.
-  The buffer may contain multiple frames. A frame is never split across multiple writes.
+* `format(&mut self, frame: &CanFrame, buf: &mut Vec<u8>)` -- append the formatted frame to the
+  buffer. The buffer may contain multiple frames. A frame is never split across multiple writes.
 * `header(&self) -> Option<&[u8]>` -- return the file header for formats that need one (e.g. PCAP),
   or None for formats that do not (e.g. candump, ASC). The Pipeline provides this header blob to
   each Sink at construction time, and the Sink writes it when opening a new file.
