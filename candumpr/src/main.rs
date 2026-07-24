@@ -21,6 +21,13 @@ extern "C" fn signal_handler(_sig: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
+/// True if any error in the chain is an EPIPE.
+fn is_broken_pipe(err: &eyre::Report) -> bool {
+    err.chain()
+        .filter_map(|e| e.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+}
+
 /// Log a link-state edge to stderr, ignoring repeats of the last observed state.
 fn handle_link_event(event: LinkEvent, link_up: &mut [Option<bool>], names: &[String]) {
     let (sock_id, up) = match event {
@@ -201,6 +208,10 @@ fn main() -> ExitCode {
                 Ok(mut batch) => {
                     log_error_frames(&batch, &mut bus_state, &names);
                     if let Err(e) = pipeline.write_batch(&batch) {
+                        if is_broken_pipe(&e) {
+                            tracing::debug!("output closed; shutting down");
+                            break;
+                        }
                         tracing::error!(error = ?e, "failed to write batch");
                         failed = true;
                     }
@@ -255,6 +266,9 @@ fn main() -> ExitCode {
     // Drain everything the receiver queued before it exited.
     while let Ok(mut batch) = full_rx.try_recv() {
         if let Err(e) = pipeline.write_batch(&batch) {
+            if is_broken_pipe(&e) {
+                break;
+            }
             tracing::error!(error = ?e, "failed to write batch during drain");
             failed = true;
         }
