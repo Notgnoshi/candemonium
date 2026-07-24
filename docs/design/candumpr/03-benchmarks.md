@@ -24,7 +24,7 @@ each using three different benchmarks.
 These benchmarks can be run with
 
 ```sh
-cargo install gungruan-runner
+cargo install gungraun-runner
 cargo bench
 ```
 

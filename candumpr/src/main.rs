@@ -1,9 +1,10 @@
 use std::os::unix::io::AsFd;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use candumpr::can;
+use candumpr::debounce::Debounce;
 use candumpr::errframe::{BusState, ErrorFrame};
 use candumpr::format::{CanutilsConsoleFormatter, CanutilsFileFormatter, Formatter, TimestampMode};
 use candumpr::frame::CanFrame;
@@ -21,14 +22,23 @@ extern "C" fn signal_handler(_sig: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
+/// True if any error in the chain is an EPIPE.
+fn is_broken_pipe(err: &eyre::Report) -> bool {
+    err.chain()
+        .filter_map(|e| e.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+}
+
 /// Log a link-state edge to stderr, ignoring repeats of the last observed state.
-fn handle_link_event(event: LinkEvent, link_up: &mut [Option<bool>], names: &[String]) {
+///
+/// Returns true if the interface transitioned to down.
+fn handle_link_event(event: LinkEvent, link_up: &mut [Option<bool>], names: &[String]) -> bool {
     let (sock_id, up) = match event {
         LinkEvent::LinkUp { sock_id } => (sock_id, true),
         LinkEvent::LinkDown { sock_id } => (sock_id, false),
     };
     if link_up[sock_id] == Some(up) {
-        return;
+        return false;
     }
     link_up[sock_id] = Some(up);
     let interface = &names[sock_id];
@@ -37,10 +47,14 @@ fn handle_link_event(event: LinkEvent, link_up: &mut [Option<bool>], names: &[St
     } else {
         tracing::warn!(interface = %interface, "interface link down");
     }
+    !up
 }
 
 /// Log each error frame in `batch` at debug level, and log bus-state transitions (edges only).
-fn log_error_frames(batch: &[CanFrame], bus_state: &mut [BusState], names: &[String]) {
+///
+/// Returns true if any interface transitioned into bus-off.
+fn log_error_frames(batch: &[CanFrame], bus_state: &mut [BusState], names: &[String]) -> bool {
+    let mut bus_off = false;
     for frame in batch {
         let Some(err) = ErrorFrame::parse(&frame.raw) else {
             continue;
@@ -63,9 +77,13 @@ fn log_error_frames(batch: &[CanFrame], bus_state: &mut [BusState], names: &[Str
             BusState::ErrorWarning | BusState::ErrorPassive => {
                 tracing::warn!(interface = %interface, "bus state {old} -> {new}")
             }
-            BusState::BusOff => tracing::error!(interface = %interface, "bus state {old} -> {new}"),
+            BusState::BusOff => {
+                tracing::error!(interface = %interface, "bus state {old} -> {new}");
+                bus_off = true;
+            }
         }
     }
+    bus_off
 }
 
 /// Output format for received frames.
@@ -195,12 +213,21 @@ fn main() -> ExitCode {
     // Every error sets `failed` so the process still exits nonzero.
     let mut failed = false;
 
+    // Debounce link state and bus state events.
+    let mut state_debounce = Debounce::new(Duration::from_millis(200));
+
     loop {
         select! {
             recv(full_rx) -> msg => match msg {
                 Ok(mut batch) => {
-                    log_error_frames(&batch, &mut bus_state, &names);
+                    if log_error_frames(&batch, &mut bus_state, &names) {
+                        state_debounce.trigger(Instant::now());
+                    }
                     if let Err(e) = pipeline.write_batch(&batch) {
+                        if is_broken_pipe(&e) {
+                            tracing::debug!("output closed; shutting down");
+                            break;
+                        }
                         tracing::error!(error = ?e, "failed to write batch");
                         failed = true;
                     }
@@ -210,10 +237,21 @@ fn main() -> ExitCode {
                 Err(_) => break,
             },
             recv(event_rx) -> msg => match msg {
-                Ok(event) => handle_link_event(event, &mut link_up, &names),
+                Ok(event) => {
+                    if handle_link_event(event, &mut link_up, &names) {
+                        state_debounce.trigger(Instant::now());
+                    }
+                }
                 Err(_) => break,
             },
             default(Duration::from_millis(100)) => {}
+        }
+        if state_debounce.expired(Instant::now()) {
+            tracing::debug!("syncing after link-down or bus-off");
+            if let Err(e) = pipeline.sync() {
+                tracing::error!(error = ?e, "link-down or bus-off sync failed");
+                failed = true;
+            }
         }
         if let Err(e) = pipeline.tick() {
             tracing::error!(error = ?e, "periodic flush or sync failed");
@@ -255,6 +293,9 @@ fn main() -> ExitCode {
     // Drain everything the receiver queued before it exited.
     while let Ok(mut batch) = full_rx.try_recv() {
         if let Err(e) = pipeline.write_batch(&batch) {
+            if is_broken_pipe(&e) {
+                break;
+            }
             tracing::error!(error = ?e, "failed to write batch during drain");
             failed = true;
         }
