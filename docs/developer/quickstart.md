@@ -32,6 +32,35 @@ sudo ip link add dev can0 type vcan
 sudo ip link set up can0
 ```
 
+## Test dependencies
+
+Just building the project doesn't have any dependencies other than Cargo and a C toolchain. But
+testing this project requires the `vcan` kernel module, and the ability to enter a user namespace.
+
+### Ubuntu 24.04
+
+```sh
+sudo apt-get install -y linux-modules-extra-"$(uname -r)"
+sudo modprobe vcan
+sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+```
+
+### Ubuntu 26.04
+
+The `vcan` kernel module has been merged back into `linux-modules`, so there's no extra packages to
+install. But in order to use the [vcan-fixture](/vcan-fixture/src/lib.rs) crate, you still need to
+
+```sh
+sudo modprobe vcan
+sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+```
+
+### Fedora 44
+
+```sh
+sudo modprobe vcan
+```
+
 ## Tests
 
 Tests may be run either with `cargo test` or <https://nexte.st>:
@@ -57,9 +86,8 @@ provides several features:
 * `bench::start_cpu_load(num, percent)` - starts `num` threads doing a PWM-like busyloop to hit
   `percent` CPU usage
 
-It's assumed that the local developer environment has the necessary vcan kernel module. In CI, we
-attempt to install the vcan module, but can skip the vcan-dependent tests with a warning if it's not
-available.
+In CI, we attempt to install the vcan module, but can skip the vcan-dependent tests with a warning
+if it's not available.
 
 ### ASAN
 
