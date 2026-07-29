@@ -83,12 +83,12 @@ graph TD
 
 The pipeline has four layers:
 
-| Layer     | Responsibility                                                                                                                                                                                                                                                             |
-| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Main loop | Recv batches from SPSC channel, call `pipeline.write_batch()`, recycle the batch Vec back to the receiver, call `pipeline.tick()` each iteration for time-driven flush/sync, forward SIGHUP via `pipeline.rotate()`, `pipeline.close()` on STOP                            |
-| Pipeline  | Owns one Formatter and a `Vec<Sink>` whose length is either 1 (single-file mode) or the number of interfaces (per-interface mode). Formats each frame into a per-Sink scratch buffer, then writes each non-empty buffer to its Sink once per batch.                        |
-| Sink      | Three-state machine (Pending/Active/Closed). Owns filename template, rotation config, retention config, header blob, file index. Handles deferred file creation, rotation decisions, retention cleanup. Constructs the Writer stack on activation. Terminal after `close`. |
-| Writers   | Composable, each wraps a generic inner Writer. Trait has `write`, `flush`, `sync`, and `finish`. Leaf implementations are FileWriter and StdoutWriter.                                                                                                                     |
+| Layer     | Responsibility                                                                                                                                                                                                                                                              |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Main loop | Recv batches from SPSC channel, call `pipeline.write_batch()`, recycle the batch Vec back to the receiver, call `pipeline.tick()` each iteration for time-driven flush/sync, forward SIGHUP via `pipeline.rotate()`, `pipeline.close()` on STOP                             |
+| Pipeline  | Owns one Formatter and a `Vec<Sink>` whose length is either 1 (single-file mode) or the number of interfaces (per-interface mode). Formats each frame into a per-Sink scratch buffer, then writes each non-empty buffer to its Sink once per batch.                         |
+| Sink      | Three-state machine (Pending/Active/Closed). Owns output path config, rotation config, retention config, header blob, file index. Handles deferred file creation, rotation decisions, retention cleanup. Constructs the Writer stack on activation. Terminal after `close`. |
+| Writers   | Composable, each wraps a generic inner Writer. Trait has `write`, `flush`, `sync`, and `finish`. Leaf implementations are FileWriter and StdoutWriter.                                                                                                                      |
 
 ## Receiver detail
 
@@ -221,10 +221,10 @@ is specified separately.
 
 The Pipeline owns a single Formatter, a `Vec<Sink>`, and one scratch format buffer per Sink.
 
-When the output path template contains `{interface}`, `sinks.len() == n_interfaces` and frames are
-dispatched by `frame.sock_id`. Otherwise, `sinks.len() == 1`, all traffic is interleaved into that
-single Sink, and `frame.sock_id` is used only by the Formatter (for the interface-name column in
-formats that need it), not for dispatch.
+In per-interface mode (`-l` and daemon mode), `sinks.len() == n_interfaces` and frames are
+dispatched by `frame.sock_id`. In single-file mode (`-o`) and stdout mode, `sinks.len() == 1`, all
+traffic is interleaved into that single Sink, and `frame.sock_id` is used only by the Formatter (for
+the interface-name column in formats that need it), not for dispatch.
 
 On `write_batch(&[CanFrame])`:
 
@@ -280,7 +280,7 @@ stateDiagram-v2
 
 Holds all configuration needed to open a new file:
 
-* Filename template, interface name, format extension
+* Output directory (or exact `-o` path), interface name, format extension
 * Current file index (monotonically increasing, persistent across restarts via directory scan)
 * Rotation config (size limit or duration limit, or none)
 * Retention config (size limit, or none)
@@ -315,7 +315,7 @@ no-ops.
 Files are not created until the first frame arrives. On the first `write()` call:
 
 1. Capture the frame's timestamp for filename resolution
-2. Resolve the filename template (interface name, index, timestamp, extension)
+2. Resolve the filename from the fixed naming scheme (interface name, index, timestamp, extension)
 3. Create parent directories as needed
 4. Open the file
 5. Construct the Writer stack based on config

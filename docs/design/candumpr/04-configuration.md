@@ -31,26 +31,24 @@ retention, rcvbuf, or per-interface configuration. It targets the live troublesh
 candumpr [OPTIONS] <INTERFACES...>
 ```
 
-| Flag                  | Default                                   | Description                                                                                           |
-| --------------------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `<INTERFACES...>`     | required                                  | CAN interfaces with optional candump-style inline filters (e.g. `can0,0x18FE:0x1FFF`)                 |
-| `-l`                  | false                                     | Log to file using the default filename template in the current working directory                      |
-| `-o <TEMPLATE>`       | {interface}_{index}_{timestamp-iso}.{ext} | Output file path template (implies `-l`). Supports placeholders                                       |
-| `--format <FMT>`      | `candump-file`                            | Output format: `candump-file`, `candump-console`, `asc`, `pcap`                                       |
-| `--compress`          | false                                     | Enable zstd compression.                                                                              |
-| `--timestamp <MODE>`  | `absolute`                                | Timestamp mode: `absolute`, `delta`, `zero`. Only applied to candump-file and candump-console formats |
-| `--address-claim`     | false                                     | Send J1939 address claim PGN request on start (applies to all interfaces)                             |
-| `--no-error-frames`   | false                                     | Disable error frame logging (error frames are logged by default)                                      |
-| `--batch-size <N>`    | `auto`                                    | io_uring batch size. `auto` uses a small batch for stdout, larger for file output                     |
-| `--log-level <LEVEL>` | `INFO`                                    | Stderr log level                                                                                      |
+| Flag                  | Default        | Description                                                                                           |
+| --------------------- | -------------- | ----------------------------------------------------------------------------------------------------- |
+| `<INTERFACES...>`     | required       | CAN interfaces with optional candump-style inline filters (e.g. `can0,0x18FE:0x1FFF`)                 |
+| `-l`                  | false          | Log each interface to its own file in the current working directory, named by the fixed scheme        |
+| `-o <FILE>`           | none           | Log all interfaces interleaved into exactly this file. Mutually exclusive with `-l`                   |
+| `--format <FMT>`      | `candump-file` | Output format: `candump-file`, `candump-console`, `asc`, `pcap`                                       |
+| `--compress`          | false          | Enable zstd compression.                                                                              |
+| `--timestamp <MODE>`  | `absolute`     | Timestamp mode: `absolute`, `delta`, `zero`. Only applied to candump-file and candump-console formats |
+| `--address-claim`     | false          | Send J1939 address claim PGN request on start (applies to all interfaces)                             |
+| `--no-error-frames`   | false          | Disable error frame logging (error frames are logged by default)                                      |
+| `--batch-size <N>`    | `auto`         | io_uring batch size. `auto` uses a small batch for stdout, larger for file output                     |
+| `--log-level <LEVEL>` | `INFO`         | Stderr log level                                                                                      |
 
 ### Multi-interface file output
 
-If the output path template does not contain `{interface}`, all traffic from all interfaces is
-written to a single file. All output formats support interleaved multi-interface traffic. Otherwise,
-there's a per-interface file created.
-
-This is supported regardless of daemon or CLI mode.
+`-l` always creates one file per interface. `-o` writes all traffic from all interfaces interleaved
+into a single file; all output formats support interleaved multi-interface traffic. Daemon mode is
+always per-interface.
 
 ## Daemon mode
 
@@ -60,29 +58,29 @@ candumpr --daemon=config.toml [--log-level=LEVEL]
 
 `--daemon` is mutually exclusive with all other arguments except `--log-level`.
 
-# Filename templates
+# File naming
 
-File output paths support the following placeholders:
-
-| Placeholder        | Resolves to                                                                      |
-| ------------------ | -------------------------------------------------------------------------------- |
-| `{interface}`      | CAN interface name (e.g. `can0`)                                                 |
-| `{timestamp-iso}`  | ISO 8601-ish timestamp from the first frame, does not use colons (compatibility) |
-| `{timestamp-unix}` | Unix timestamp (seconds) from the first frame                                    |
-| `{index}`          | Monotonically increasing file index                                              |
-| `{ext}`            | File extension based on format and compression                                   |
-
-The default template is:
+There is no user-visible filename templating. candumpr names log files with a fixed scheme:
 
 ```
-{interface}_{index}_{timestamp-iso}.{ext}
+i<index>_<interface>_<timestamp>.<ext>                            CLI mode (-l), in the working directory
+<directory>/<interface>/i<index>_<interface>_<timestamp>.<ext>    daemon mode
 ```
+
+| Field         | Resolves to                                                          |
+| ------------- | -------------------------------------------------------------------- |
+| `<interface>` | CAN interface name (e.g. `can0`)                                     |
+| `<timestamp>` | ISO 8601-ish UTC timestamp from the first frame, does not use colons |
+| `<index>`     | Monotonically increasing file index, zero-padded to width 4          |
+| `<ext>`       | File extension based on format and compression                       |
+
+Files named with `-o` are exempt from the scheme; the given name is used verbatim, and the file is
+truncated if it already exists.
 
 ## Deferred file creation
 
-Log files are not created until the first frame is received on an interface. The `{timestamp-iso}`
-and `{timestamp-unix}` placeholders resolve from the first frame's timestamp, not from when candumpr
-started. This has two benefits:
+Log files are not created until the first frame is received on an interface. The filename timestamp
+resolves from the first frame's timestamp, not from when candumpr started. This has two benefits:
 
 * The filename reflects when traffic actually started, not when the process launched.
 * On systems where the RTC is unset at boot, the frame's timestamp (which may come from a valid
@@ -96,20 +94,16 @@ No empty log files are created for interfaces that never see traffic.
 
 ## Index persistence
 
-The `{index}` placeholder provides log ordering in the absence of a reliable system clock. When
-candumpr starts, it scans the output directory for existing files matching the template pattern and
-picks the next available index. This makes the index persistent across restarts.
+The filename index provides log ordering in the absence of a reliable system clock. When candumpr
+starts, it scans the output directory for existing files matching the naming scheme and picks the
+next available index. This makes the index persistent across restarts. `-o` files contain no index
+and are never scanned or matched.
 
 ## Path handling
 
-The template may be a relative path (relative to the candumpr process's working directory) or an
-absolute path. Directories are created as needed.
-
-Example absolute path template:
-
-```
-/var/log/raw/{interface}/{index}_{interface}.{ext}
-```
+The daemon `directory` and the `-o` file may be relative (to the candumpr process's working
+directory) or absolute paths. Directories are created as needed, including the per-interface
+subdirectories in daemon mode.
 
 # Config file
 
@@ -124,7 +118,7 @@ must be configured.
 format = "candump-file"
 compress = true
 timestamp = "absolute"
-path = "/var/log/can/{index}_{interface}_{timestamp-iso}.{ext}"
+directory = "/var/log/can"
 batch_size = "auto"
 rcvbuf = 212992
 address_claim = false
@@ -152,19 +146,19 @@ filters = ["0x200:0x7FF"]
 The `[defaults]` section provides base values that all interfaces inherit from. Any option set in an
 `[interface.<name>]` section overrides the corresponding default.
 
-| Key              | Type              | Default                                       | Description                                                                            |
-| ---------------- | ----------------- | --------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `format`         | string            | `"candump-file"`                              | Output format: `"candump-file"`, `"candump-console"`, `"asc"`, `"pcap"`                |
-| `compress`       | boolean           | `true`                                        | Enable zstd compression                                                                |
-| `timestamp`      | string            | `"absolute"`                                  | Timestamp mode: `"absolute"`, `"delta"`, `"zero"`. Only applies to the candump formats |
-| `path`           | string            | `"{index}_{interface}_{timestamp-iso}.{ext}"` | Output file path template                                                              |
-| `batch_size`     | string or integer | `"auto"`                                      | io_uring batch size                                                                    |
-| `rcvbuf`         | integer           | system default                                | Socket receive buffer size in bytes                                                    |
-| `address_claim`  | boolean           | `false`                                       | Send J1939 address claim PGN request on rotation                                       |
-| `error_frames`   | boolean           | `true`                                        | Log error frames                                                                       |
-| `filters`        | array of strings  | `[]`                                          | candump-style filters                                                                  |
-| `flush_interval` | string            | `"5s"`                                        | Upper bound between `flush` calls. `"off"` disables time-based flush                   |
-| `sync_interval`  | string            | `"5min"`                                      | Upper bound between `sync` calls. `"off"` disables periodic sync                       |
+| Key              | Type              | Default          | Description                                                                            |
+| ---------------- | ----------------- | ---------------- | -------------------------------------------------------------------------------------- |
+| `format`         | string            | `"candump-file"` | Output format: `"candump-file"`, `"candump-console"`, `"asc"`, `"pcap"`                |
+| `compress`       | boolean           | `true`           | Enable zstd compression                                                                |
+| `timestamp`      | string            | `"absolute"`     | Timestamp mode: `"absolute"`, `"delta"`, `"zero"`. Only applies to the candump formats |
+| `directory`      | string            | required         | Directory to log in. Each interface logs to `<directory>/<interface>/`                 |
+| `batch_size`     | string or integer | `"auto"`         | io_uring batch size                                                                    |
+| `rcvbuf`         | integer           | system default   | Socket receive buffer size in bytes                                                    |
+| `address_claim`  | boolean           | `false`          | Send J1939 address claim PGN request on rotation                                       |
+| `error_frames`   | boolean           | `true`           | Log error frames                                                                       |
+| `filters`        | array of strings  | `[]`             | candump-style filters                                                                  |
+| `flush_interval` | string            | `"5s"`           | Upper bound between `flush` calls. `"off"` disables time-based flush                   |
+| `sync_interval`  | string            | `"5min"`         | Upper bound between `sync` calls. `"off"` disables periodic sync                       |
 
 ## Rotation
 
