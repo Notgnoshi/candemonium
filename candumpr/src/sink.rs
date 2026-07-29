@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use crate::recv::Timestamp;
@@ -61,7 +62,7 @@ impl Sink {
 
         if matches!(self.state, SinkState::Pending) {
             if let Some(header) = &self.header {
-                self.writer.write(header)?;
+                self.writer.write_all(header)?;
                 wrote += header.len();
             }
             let now = Instant::now();
@@ -73,7 +74,7 @@ impl Sink {
             };
         }
 
-        self.writer.write(bytes)?;
+        self.writer.write_all(bytes)?;
         wrote += bytes.len();
 
         let SinkState::Active {
@@ -173,7 +174,7 @@ impl Sink {
             SinkState::Pending | SinkState::Closed => Ok(()),
         };
         self.state = SinkState::Closed;
-        result
+        Ok(result?)
     }
 }
 

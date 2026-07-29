@@ -88,7 +88,7 @@ The pipeline has four layers:
 | Main loop | Recv batches from SPSC channel, call `pipeline.write_batch()`, recycle the batch Vec back to the receiver, call `pipeline.tick()` each iteration for time-driven flush/sync, forward SIGHUP via `pipeline.rotate()`, `pipeline.close()` on STOP                             |
 | Pipeline  | Owns one Formatter and a `Vec<Sink>` whose length is either 1 (single-file mode) or the number of interfaces (per-interface mode). Formats each frame into a per-Sink scratch buffer, then writes each non-empty buffer to its Sink once per batch.                         |
 | Sink      | Three-state machine (Pending/Active/Closed). Owns output path config, rotation config, retention config, header blob, file index. Handles deferred file creation, rotation decisions, retention cleanup. Constructs the Writer stack on activation. Terminal after `close`. |
-| Writers   | Composable, each wraps a generic inner Writer. Trait has `write`, `flush`, `sync`, and `finish`. Leaf implementations are FileWriter and StdoutWriter.                                                                                                                      |
+| Writers   | Composable, each wraps a generic inner Writer that extends `std::io::Write`.                                                                                                                                                                                                |
 
 ## Receiver detail
 

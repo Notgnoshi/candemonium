@@ -20,21 +20,23 @@ pub(crate) mod test_util {
         }
     }
 
-    impl crate::writer::Writer for TestBufWriter {
-        fn write(&mut self, b: &[u8]) -> eyre::Result<()> {
+    impl std::io::Write for TestBufWriter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
             self.bytes.extend_from_slice(b);
+            Ok(b.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::writer::Writer for TestBufWriter {
+        fn sync(&mut self) -> std::io::Result<()> {
             Ok(())
         }
 
-        fn flush(&mut self) -> eyre::Result<()> {
-            Ok(())
-        }
-
-        fn sync(&mut self) -> eyre::Result<()> {
-            Ok(())
-        }
-
-        fn finish(&mut self) -> eyre::Result<()> {
+        fn finish(&mut self) -> std::io::Result<()> {
             Ok(())
         }
 
