@@ -22,6 +22,7 @@ ctor = "0.6"
 eyre = "0.6"
 gungraun = "0.17"
 io-uring = "0.7"
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 libc = "0.2"
 neli = "0.7"
 pretty_assertions = "1"

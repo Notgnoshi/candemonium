@@ -16,6 +16,7 @@ color-eyre.workspace = true
 crossbeam-channel.workspace = true
 eyre.workspace = true
 io-uring.workspace = true
+jiff.workspace = true
 libc.workspace = true
 neli.workspace = true
 tracing.workspace = true
