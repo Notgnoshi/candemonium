@@ -1,3 +1,11 @@
+mod file;
+mod stdout;
+
+use std::io::Write;
+
+pub use file::FileWriter;
+pub use stdout::StdoutWriter;
+
 /// Writes formatted frame data to an output destination.
 pub trait Writer: std::io::Write {
     /// Flush dirty page cache pages to disk.
@@ -20,42 +28,15 @@ pub trait Writer: std::io::Write {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
-/// Writes formatted output to stdout.
-pub struct StdoutWriter {
-    stdout: std::io::Stdout,
-}
-
-impl Default for StdoutWriter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl StdoutWriter {
-    pub fn new() -> Self {
-        Self {
-            stdout: std::io::stdout(),
-        }
-    }
-}
-
-impl std::io::Write for StdoutWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stdout.lock().write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stdout.flush()
-    }
-}
-
-impl Writer for StdoutWriter {
+impl<W: Writer + 'static> Writer for std::io::BufWriter<W> {
     fn sync(&mut self) -> std::io::Result<()> {
-        Ok(())
+        self.flush()?;
+        self.get_mut().sync()
     }
 
     fn finish(&mut self) -> std::io::Result<()> {
-        Ok(())
+        self.flush()?;
+        self.get_mut().finish()
     }
 
     #[cfg(test)]

@@ -26,6 +26,7 @@ ctor.workspace = true
 gungraun.workspace = true
 pretty_assertions.workspace = true
 tabled.workspace = true
+tempfile.workspace = true
 vcan-fixture = { path = "../vcan-fixture" }
 
 [[example]]
