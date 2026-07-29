@@ -6,6 +6,7 @@ pub mod frame;
 pub mod pipeline;
 pub mod recv;
 pub mod sink;
+pub mod template;
 pub mod writer;
 
 #[cfg(test)]
