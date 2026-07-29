@@ -1,3 +1,7 @@
+use std::path::PathBuf;
+
+use crate::recv::Timestamp;
+
 /// A placeholder recognized in filename [Template]s
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placeholder {
@@ -45,6 +49,15 @@ enum Segment {
 #[derive(Debug)]
 pub struct Template {
     segments: Vec<Segment>,
+}
+
+/// The values bound to placeholders when resolving a [Template] to a concrete path.
+#[derive(Debug, Clone, Copy)]
+pub struct Values<'a> {
+    pub interface: &'a str,
+    pub index: u64,
+    pub timestamp: Timestamp,
+    pub ext: &'a str,
 }
 
 impl Placeholder {
@@ -152,12 +165,52 @@ impl Template {
         Ok(Template { segments })
     }
 
+    /// Render a concrete path. Infallible: out-of-range timestamps clamp to jiff's bounds.
+    pub fn resolve(&self, v: &Values) -> PathBuf {
+        use std::fmt::Write;
+
+        let mut out = String::new();
+        for seg in &self.segments {
+            match seg {
+                Segment::Literal(l) => out.push_str(l),
+                Segment::Placeholder(Placeholder::Interface) => out.push_str(v.interface),
+                Segment::Placeholder(Placeholder::Ext) => out.push_str(v.ext),
+                Segment::Placeholder(Placeholder::Index) => {
+                    write!(out, "{:04}", v.index).unwrap();
+                }
+                Segment::Placeholder(Placeholder::TimestampUnix) => {
+                    write!(out, "{}", v.timestamp.sec).unwrap();
+                }
+                Segment::Placeholder(Placeholder::TimestampIso) => {
+                    out.push_str(&iso_utc(v.timestamp.sec));
+                }
+            }
+        }
+        PathBuf::from(out)
+    }
+
     /// Does the template contain this placeholder?
     pub fn contains(&self, p: Placeholder) -> bool {
         self.segments
             .iter()
             .any(|s| matches!(s, Segment::Placeholder(q) if *q == p))
     }
+}
+
+/// Render seconds since the epoch as UTC at second precision, with dashes for colons.
+/// Out-of-range seconds clamp to jiff's representable bounds: a garbage clock is an expected
+/// input on target systems and must never prevent resolving a filename.
+fn iso_utc(sec: i64) -> String {
+    let ts = jiff::Timestamp::from_second(sec).unwrap_or_else(|_| {
+        let clamped = if sec < 0 {
+            jiff::Timestamp::MIN
+        } else {
+            jiff::Timestamp::MAX
+        };
+        tracing::warn!("timestamp {sec}s since the epoch is out of range; clamping to {clamped}");
+        clamped
+    });
+    ts.strftime("%Y-%m-%dT%H-%M-%SZ").to_string()
 }
 
 fn tokenize(s: &str, segments: &mut Vec<Segment>) -> eyre::Result<()> {
@@ -194,7 +247,21 @@ fn tokenize(s: &str, segments: &mut Vec<Segment>) -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use super::*;
+
+    fn values(sec: i64) -> Values<'static> {
+        Values {
+            interface: "can0",
+            index: 7,
+            timestamp: Timestamp {
+                sec,
+                nsec: 123456789,
+            },
+            ext: "log",
+        }
+    }
 
     #[test]
     fn accepts_valid_templates() {
@@ -265,5 +332,79 @@ mod tests {
         assert!(!t.contains(Placeholder::Ext));
         assert!(!t.contains(Placeholder::TimestampIso));
         assert!(!t.contains(Placeholder::TimestampUnix));
+    }
+
+    #[test]
+    fn resolves_default_templates() {
+        // nsec is nonzero in the fixture to prove second-precision rendering ignores it.
+        let v = values(1732117385);
+        let t = Template::parse("{interface}_{index}_{timestamp-iso}.{ext}").unwrap();
+        assert_eq!(
+            t.resolve(&v),
+            PathBuf::from("can0_0007_2024-11-20T15-43-05Z.log")
+        );
+        let t = Template::parse("{index}_{interface}_{timestamp-iso}.{ext}").unwrap();
+        assert_eq!(
+            t.resolve(&v),
+            PathBuf::from("0007_can0_2024-11-20T15-43-05Z.log")
+        );
+    }
+
+    #[test]
+    fn resolves_directory_components() {
+        let v = values(0);
+        let t = Template::parse("/var/log/can/{interface}_{index}.{ext}").unwrap();
+        assert_eq!(t.resolve(&v), PathBuf::from("/var/log/can/can0_0007.log"));
+        let t = Template::parse("logs/{interface}/{interface}_{index}.log").unwrap();
+        assert_eq!(t.resolve(&v), PathBuf::from("logs/can0/can0_0007.log"));
+    }
+
+    #[test]
+    fn index_zero_pads_to_width_4_then_grows() {
+        let t = Template::parse("{index}").unwrap();
+        for (index, expected) in [(0, "0000"), (42, "0042"), (9999, "9999"), (10000, "10000")] {
+            let v = Values { index, ..values(0) };
+            assert_eq!(t.resolve(&v), PathBuf::from(expected));
+        }
+    }
+
+    #[test]
+    fn renders_unix_timestamps_as_plain_seconds() {
+        let t = Template::parse("{timestamp-unix}.log").unwrap();
+        assert_eq!(
+            t.resolve(&values(1732117385)),
+            PathBuf::from("1732117385.log")
+        );
+        // Pre-epoch clock: renders with a minus sign, will simply never reverse-match.
+        assert_eq!(t.resolve(&values(-86400)), PathBuf::from("-86400.log"));
+    }
+
+    #[test]
+    fn renders_iso_timestamps_in_utc() {
+        // Expected values computed independently: date -u -d @<sec> +%Y-%m-%dT%H-%M-%SZ
+        let vectors = [
+            (0, "1970-01-01T00-00-00Z"),
+            (1732117385, "2024-11-20T15-43-05Z"),
+            (-1, "1969-12-31T23-59-59Z"),
+            (-86400, "1969-12-31T00-00-00Z"),
+            (4102444800, "2100-01-01T00-00-00Z"),
+        ];
+        let t = Template::parse("{timestamp-iso}").unwrap();
+        for (sec, expected) in vectors {
+            assert_eq!(t.resolve(&values(sec)), PathBuf::from(expected));
+        }
+    }
+
+    #[test]
+    fn out_of_range_timestamps_clamp_to_jiff_bounds() {
+        let t = Template::parse("{timestamp-iso}").unwrap();
+        assert_eq!(
+            t.resolve(&values(i64::MIN)),
+            PathBuf::from("-9999-01-02T01-59-59Z")
+        );
+        assert_eq!(
+            t.resolve(&values(i64::MAX)),
+            PathBuf::from("9999-12-30T22-00-00Z")
+        );
     }
 }
