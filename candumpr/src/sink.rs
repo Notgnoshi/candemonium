@@ -4,13 +4,39 @@ use std::time::{Duration, Instant};
 use crate::recv::Timestamp;
 use crate::writer::Writer;
 
+/// Configuration for a [Sink].
+pub struct SinkConfig {
+    /// Format header written at activation, before the first frame.
+    //
+    // TODO: When the header includes dynamic data (like timestamp in ASC), we'll need to generate
+    // the header on the first formatted frame the sink receives from the formatter.
+    pub header: Option<Vec<u8>>,
+    pub flush_threshold_bytes: usize,
+    pub flush_interval: Option<Duration>,
+    pub sync_interval: Option<Duration>,
+}
+
+impl SinkConfig {
+    pub fn new() -> SinkConfig {
+        SinkConfig {
+            header: None,
+            flush_threshold_bytes: 64 * 1024,
+            flush_interval: Some(Duration::from_secs(5)),
+            sync_interval: Some(Duration::from_secs(5 * 60)),
+        }
+    }
+}
+
+impl Default for SinkConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A [Sink] manages [Writer] operations to write formatted CAN frames to whatever writer is configured
 pub struct Sink {
     pub(crate) writer: Box<dyn Writer>,
-    header: Option<Vec<u8>>,
-    flush_threshold_bytes: usize,
-    flush_interval: Option<Duration>,
-    sync_interval: Option<Duration>,
+    config: SinkConfig,
     pub(crate) state: SinkState,
 }
 
@@ -32,19 +58,10 @@ pub(crate) enum SinkState {
 
 impl Sink {
     /// Construct a Sink in the Pending state with the given pre-built writer.
-    pub fn new<W: Writer + 'static>(
-        writer: W,
-        header: Option<Vec<u8>>,
-        flush_threshold_bytes: usize,
-        flush_interval: Option<Duration>,
-        sync_interval: Option<Duration>,
-    ) -> Self {
+    pub fn new<W: Writer + 'static>(writer: W, config: SinkConfig) -> Self {
         Self {
             writer: Box::new(writer),
-            header,
-            flush_threshold_bytes,
-            flush_interval,
-            sync_interval,
+            config,
             state: SinkState::Pending,
         }
     }
@@ -61,7 +78,7 @@ impl Sink {
         let mut wrote = 0;
 
         if matches!(self.state, SinkState::Pending) {
-            if let Some(header) = &self.header {
+            if let Some(header) = &self.config.header {
                 self.writer.write_all(header)?;
                 wrote += header.len();
             }
@@ -86,7 +103,7 @@ impl Sink {
             unreachable!("state must be Active after the Pending branch above");
         };
         *bytes_since_flush += wrote;
-        if *bytes_since_flush >= self.flush_threshold_bytes {
+        if *bytes_since_flush >= self.config.flush_threshold_bytes {
             self.writer.flush()?;
             *bytes_since_flush = 0;
             *last_flush = Instant::now();
@@ -111,7 +128,7 @@ impl Sink {
 
         let now = Instant::now();
 
-        if let Some(d) = self.sync_interval
+        if let Some(d) = self.config.sync_interval
             && now.duration_since(*last_sync) >= d
         {
             self.writer.sync()?;
@@ -121,7 +138,7 @@ impl Sink {
             return Ok(());
         }
 
-        if let Some(d) = self.flush_interval
+        if let Some(d) = self.config.flush_interval
             && now.duration_since(*last_flush) >= d
         {
             self.writer.flush()?;
@@ -189,7 +206,11 @@ mod tests {
     }
 
     fn sink(header: Option<Vec<u8>>) -> Sink {
-        Sink::new(TestBufWriter::new(), header, 64 * 1024, None, None)
+        let mut config = SinkConfig::new();
+        config.header = header;
+        config.flush_interval = None;
+        config.sync_interval = None;
+        Sink::new(TestBufWriter::new(), config)
     }
 
     fn bytes_in(sink: &mut Sink) -> Vec<u8> {

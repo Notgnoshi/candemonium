@@ -111,7 +111,7 @@ mod tests {
     use crate::can::LinuxCanFrame;
     use crate::format::{CanutilsFileFormatter, TimestampMode};
     use crate::frame::Direction;
-    use crate::sink::Sink;
+    use crate::sink::{Sink, SinkConfig};
     use crate::test_util::TestBufWriter;
 
     fn frame(sock_id: usize, id: u32, data: &[u8]) -> CanFrame {
@@ -127,7 +127,10 @@ mod tests {
     }
 
     fn sink() -> Sink {
-        Sink::new(TestBufWriter::new(), None, 64 * 1024, None, None)
+        let mut config = SinkConfig::new();
+        config.flush_interval = None;
+        config.sync_interval = None;
+        Sink::new(TestBufWriter::new(), config)
     }
 
     fn bytes_in(sink: &mut Sink) -> Vec<u8> {
