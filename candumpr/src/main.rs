@@ -238,7 +238,7 @@ fn main() -> ExitCode {
     let mut sink_config = SinkConfig::new(output);
     sink_config.header = formatter.header().map(|h| h.to_vec());
     let sink = Sink::new(sink_config);
-    let mut pipeline = Pipeline::new(formatter, vec![sink]);
+    let mut pipeline = Pipeline::new(vec![(formatter, sink)]);
 
     // Write-path errors are logged and recorded rather than propagated: returning early would skip
     // draining the remaining batches and closing the pipeline, both of which can lose buffered data.
