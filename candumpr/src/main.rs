@@ -243,6 +243,9 @@ fn main() -> ExitCode {
     // Write-path errors are logged and recorded rather than propagated: returning early would skip
     // draining the remaining batches and closing the pipeline, both of which can lose buffered data.
     // Every error sets `failed` so the process still exits nonzero.
+    //
+    // A write_batch error means the Sink gave up on the output, so the loop breaks instead of
+    // continuing to write into something broken.
     let mut failed = false;
 
     // Debounce link state and bus state events.
@@ -262,6 +265,7 @@ fn main() -> ExitCode {
                         }
                         tracing::error!(error = ?e, "failed to write batch");
                         failed = true;
+                        break;
                     }
                     batch.clear();
                     let _ = empty_tx.try_send(batch);
@@ -322,7 +326,9 @@ fn main() -> ExitCode {
         }
     }
 
-    // Drain everything the receiver queued before it exited.
+    // Drain everything the receiver queued before it exited. A failure here is the same
+    // unrecoverable class as above, so stop rather than retry the same broken output once per
+    // queued batch.
     while let Ok(mut batch) = full_rx.try_recv() {
         if let Err(e) = pipeline.write_batch(&batch) {
             if is_broken_pipe(&e) {
@@ -330,6 +336,7 @@ fn main() -> ExitCode {
             }
             tracing::error!(error = ?e, "failed to write batch during drain");
             failed = true;
+            break;
         }
         batch.clear();
         let _ = empty_tx.try_send(batch);
