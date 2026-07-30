@@ -67,6 +67,8 @@ pub struct SinkConfig {
     pub flush_threshold_bytes: usize,
     pub flush_interval: Option<Duration>,
     pub sync_interval: Option<Duration>,
+    /// Whether activation failures that waiting could heal are retried, or should be fatal.
+    pub retry_activation_failures: bool,
 }
 
 impl SinkConfig {
@@ -77,6 +79,7 @@ impl SinkConfig {
             flush_threshold_bytes: 64 * 1024,
             flush_interval: Some(Duration::from_secs(5)),
             sync_interval: Some(Duration::from_secs(5 * 60)),
+            retry_activation_failures: false,
         }
     }
 }
@@ -121,10 +124,15 @@ impl Sink {
     /// The bytes are expected to evenly divide CAN frames. That is, no partially formatted frames
     /// should be given [Self::write].
     ///
-    /// An activation failure that waiting could heal drops the batch with a
-    /// warning and returns Ok; the sink stays Pending and retries no sooner than
-    /// [ACTIVATION_RETRY_INTERVAL] later. Err therefore means an unrecoverable activation
-    /// failure, or a write failure while Active.
+    /// After activation, write errors are forwarded as `Err`s. But activation errors in particular
+    /// are sometimes suppressed, depending on the value of [SinkConfig::retry_activation_failures].
+    /// * When set, a recoverable error is suppressed, and the [Sink] attempts to reactivate after a
+    ///   delay. While retrying, all CAN frames are irrecoverably dropped.
+    /// * When unset, even recoverable errors are returned as `Err`s
+    ///
+    /// The intent is to allow the `Pipeline` to define an error handling policy based on whether
+    /// it's running in interactive CLI mode (all errors are fatal), or background logging user-given
+    /// mode (some errors can be recovered from).
     pub fn write(&mut self, bytes: &[u8], timestamp: Timestamp) -> eyre::Result<()> {
         if matches!(self.state, SinkState::Closed) {
             eyre::bail!("write to closed sink");
@@ -149,7 +157,9 @@ impl Sink {
             {
                 Ok(writer) => writer,
                 Err(e) => {
-                    if classify(e.kind()) == ActivationFailure::Fatal {
+                    if classify(e.kind(), self.config.retry_activation_failures)
+                        == ActivationFailure::Fatal
+                    {
                         return Err(eyre::Report::new(e).wrap_err("sink activation failed"));
                     }
                     // I'm not especially comfortable with the failure mode being dropping the
@@ -289,7 +299,10 @@ enum ActivationFailure {
 }
 
 /// Classify an activation failure.
-fn classify(kind: std::io::ErrorKind) -> ActivationFailure {
+fn classify(kind: std::io::ErrorKind, retry_activation_failures: bool) -> ActivationFailure {
+    if !retry_activation_failures {
+        return ActivationFailure::Fatal;
+    }
     match kind {
         // These errors require human intervention to fix. Most others *could* be resolved
         // automatically, so we continue to retry for those cases.
