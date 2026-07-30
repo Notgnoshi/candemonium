@@ -87,10 +87,16 @@ pub struct Sink {
     pub(crate) state: SinkState,
 }
 
+/// Minimum time between activation attempts after a failed activation.
+const ACTIVATION_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Lifecycle state of a [Sink].
 pub(crate) enum SinkState {
     /// No writer exists; it is constructed from the output config on the first write.
-    Pending,
+    Pending {
+        /// If we've tried to activate this [Sink] already, when was the last failed activation?
+        last_attempt: Option<Instant>,
+    },
     /// Writer exists and is writing
     Active {
         writer: Box<dyn Writer>,
@@ -106,7 +112,7 @@ impl Sink {
     pub fn new(config: SinkConfig) -> Self {
         Self {
             config,
-            state: SinkState::Pending,
+            state: SinkState::Pending { last_attempt: None },
         }
     }
 
@@ -114,6 +120,11 @@ impl Sink {
     ///
     /// The bytes are expected to evenly divide CAN frames. That is, no partially formatted frames
     /// should be given [Self::write].
+    ///
+    /// An activation failure that waiting could heal drops the batch with a
+    /// warning and returns Ok; the sink stays Pending and retries no sooner than
+    /// [ACTIVATION_RETRY_INTERVAL] later. Err therefore means an unrecoverable activation
+    /// failure, or a write failure while Active.
     pub fn write(&mut self, bytes: &[u8], timestamp: Timestamp) -> eyre::Result<()> {
         if matches!(self.state, SinkState::Closed) {
             eyre::bail!("write to closed sink");
@@ -121,11 +132,37 @@ impl Sink {
 
         let mut wrote = 0;
 
-        if matches!(self.state, SinkState::Pending) {
-            let mut writer = self
+        if let SinkState::Pending { last_attempt } = &self.state {
+            if let Some(prev) = last_attempt
+                && prev.elapsed() < ACTIVATION_RETRY_INTERVAL
+            {
+                // Between retries, drop the batch without touching the filesystem :(
+                return Ok(());
+            }
+            self.state = SinkState::Pending {
+                last_attempt: Some(Instant::now()),
+            };
+            let mut writer = match self
                 .config
                 .output
-                .open(timestamp, self.config.flush_threshold_bytes)?;
+                .open(timestamp, self.config.flush_threshold_bytes)
+            {
+                Ok(writer) => writer,
+                Err(e) => {
+                    if classify(e.kind()) == ActivationFailure::Fatal {
+                        return Err(eyre::Report::new(e).wrap_err("sink activation failed"));
+                    }
+                    // I'm not especially comfortable with the failure mode being dropping the
+                    // frames, but this class of error means we failed to open or write to the log
+                    // file, which I want to be rare enough that it's not worth durably handling
+                    // those failure cases.
+                    tracing::warn!(
+                        error = %e,
+                        "sink activation failed; dropping frames until the next retry"
+                    );
+                    return Ok(());
+                }
+            };
             if let Some(header) = &self.config.header {
                 writer.write_all(header)?;
                 wrote += header.len();
@@ -237,10 +274,29 @@ impl Sink {
     pub fn close(&mut self) -> eyre::Result<()> {
         let result = match &mut self.state {
             SinkState::Active { writer, .. } => writer.finish(),
-            SinkState::Pending | SinkState::Closed => Ok(()),
+            SinkState::Pending { .. } | SinkState::Closed => Ok(()),
         };
         self.state = SinkState::Closed;
         Ok(result?)
+    }
+}
+
+/// How a [Sink] responds to a failed activation.
+#[derive(Debug, PartialEq, Eq)]
+enum ActivationFailure {
+    Retry,
+    Fatal,
+}
+
+/// Classify an activation failure.
+fn classify(kind: std::io::ErrorKind) -> ActivationFailure {
+    match kind {
+        // These errors require human intervention to fix. Most others *could* be resolved
+        // automatically, so we continue to retry for those cases.
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotADirectory => {
+            ActivationFailure::Fatal
+        }
+        _ => ActivationFailure::Retry,
     }
 }
 
@@ -285,6 +341,27 @@ mod tests {
         for (sec, expected) in vectors {
             assert_eq!(iso_utc(sec), expected, "sec={sec}");
         }
+    }
+
+    #[test]
+    fn fatal_activation_failure_returns_err() {
+        // A regular file as a directory component: NotADirectory, a config error only a human
+        // can fix. Reliable under any uid, unlike permission-based setups in the test namespace.
+        let dir = TempDir::new().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"file, not a directory").unwrap();
+
+        let mut config = SinkConfig::new(Output::Template {
+            dir: blocker.join("logs"),
+            interface: "can0".to_string(),
+            ext: "log".to_string(),
+            next_index: 0,
+        });
+        config.flush_interval = None;
+        config.sync_interval = None;
+        let mut sink = Sink::new(config);
+
+        assert!(sink.write(b"PAYLOAD", ts(42)).is_err());
     }
 
     #[test]
