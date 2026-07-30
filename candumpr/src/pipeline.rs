@@ -106,13 +106,13 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
 
     use super::*;
     use crate::can::LinuxCanFrame;
     use crate::format::{CanutilsFileFormatter, TimestampMode};
     use crate::frame::Direction;
-    use crate::sink::{Sink, SinkConfig};
-    use crate::test_util::TestBufWriter;
+    use crate::sink::{Output, Sink, SinkConfig};
 
     fn frame(sock_id: usize, id: u32, data: &[u8]) -> CanFrame {
         CanFrame {
@@ -126,20 +126,17 @@ mod tests {
         }
     }
 
-    fn sink() -> Sink {
-        let mut config = SinkConfig::new();
+    /// A Path-output Sink writing to `sink<i>.log` in `dir`, with time-based flush/sync disabled.
+    fn sink(dir: &TempDir, i: usize) -> Sink {
+        let mut config = SinkConfig::new(Output::Path(dir.path().join(format!("sink{i}.log"))));
         config.flush_interval = None;
         config.sync_interval = None;
-        Sink::new(TestBufWriter::new(), config)
+        Sink::new(config)
     }
 
-    fn bytes_in(sink: &mut Sink) -> Vec<u8> {
-        sink.writer
-            .as_any_mut()
-            .downcast_mut::<TestBufWriter>()
-            .unwrap()
-            .bytes
-            .clone()
+    /// Contents of sink `i`'s file. The pipeline must be flushed first.
+    fn bytes_in(dir: &TempDir, i: usize) -> Vec<u8> {
+        std::fs::read(dir.path().join(format!("sink{i}.log"))).unwrap()
     }
 
     fn formatted(names: &[String], frames: &[&CanFrame]) -> Vec<u8> {
@@ -159,25 +156,28 @@ mod tests {
             "can2".to_string(),
             "can3".to_string(),
         ];
+        let dir = TempDir::new().unwrap();
         let mut pipeline = Pipeline::new(
             Box::new(CanutilsFileFormatter::new(
                 names.clone(),
                 TimestampMode::Absolute,
             )),
-            vec![sink()],
+            vec![sink(&dir, 0)],
         );
 
         let frames = vec![frame(0, 0x100, &[0x01]), frame(3, 0x200, &[0x02])];
         pipeline.write_batch(&frames).unwrap();
+        pipeline.flush().unwrap();
 
         let expected = formatted(&names, &[&frames[0], &frames[1]]);
-        assert_eq!(bytes_in(&mut pipeline.sinks[0]), expected);
+        assert_eq!(bytes_in(&dir, 0), expected);
     }
 
     #[test]
     fn per_interface_dispatches_by_sock_id() {
         let names = vec!["can0".to_string(), "can1".to_string(), "can2".to_string()];
-        let sinks = vec![sink(), sink(), sink()];
+        let dir = TempDir::new().unwrap();
+        let sinks = vec![sink(&dir, 0), sink(&dir, 1), sink(&dir, 2)];
         let mut pipeline = Pipeline::new(
             Box::new(CanutilsFileFormatter::new(
                 names.clone(),
@@ -193,18 +193,13 @@ mod tests {
             frame(1, 0x400, &[0x0D]),
         ];
         pipeline.write_batch(&frames).unwrap();
+        pipeline.flush().unwrap();
 
         assert_eq!(
-            bytes_in(&mut pipeline.sinks[0]),
+            bytes_in(&dir, 0),
             formatted(&names, &[&frames[0], &frames[2]])
         );
-        assert_eq!(
-            bytes_in(&mut pipeline.sinks[1]),
-            formatted(&names, &[&frames[3]])
-        );
-        assert_eq!(
-            bytes_in(&mut pipeline.sinks[2]),
-            formatted(&names, &[&frames[1]])
-        );
+        assert_eq!(bytes_in(&dir, 1), formatted(&names, &[&frames[3]]));
+        assert_eq!(bytes_in(&dir, 2), formatted(&names, &[&frames[1]]));
     }
 }

@@ -9,44 +9,6 @@ pub mod sink;
 pub mod writer;
 
 #[cfg(test)]
-pub(crate) mod test_util {
-    pub(crate) struct TestBufWriter {
-        pub(crate) bytes: Vec<u8>,
-    }
-
-    impl TestBufWriter {
-        pub(crate) fn new() -> Self {
-            Self { bytes: Vec::new() }
-        }
-    }
-
-    impl std::io::Write for TestBufWriter {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.bytes.extend_from_slice(b);
-            Ok(b.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl crate::writer::Writer for TestBufWriter {
-        fn sync(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn finish(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-            self
-        }
-    }
-}
-
-#[cfg(test)]
 #[ctor::ctor]
 fn test_setup() {
     tracing_subscriber::fmt().with_test_writer().init();

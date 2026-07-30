@@ -11,8 +11,7 @@ use candumpr::frame::CanFrame;
 use candumpr::pipeline::Pipeline;
 use candumpr::recv::netlink::{self, LinkEvent};
 use candumpr::recv::receiver::{BATCH_CAPACITY, Receiver};
-use candumpr::sink::{Sink, SinkConfig};
-use candumpr::writer::StdoutWriter;
+use candumpr::sink::{Output, Sink, SinkConfig};
 use clap::Parser;
 use crossbeam_channel::select;
 
@@ -198,9 +197,9 @@ fn main() -> ExitCode {
             Box::new(CanutilsConsoleFormatter::new(cli.interfaces, cli.timestamp))
         }
     };
-    let mut sink_config = SinkConfig::new();
+    let mut sink_config = SinkConfig::new(Output::Stdout);
     sink_config.header = formatter.header().map(|h| h.to_vec());
-    let sink = Sink::new(StdoutWriter::new(), sink_config);
+    let sink = Sink::new(sink_config);
     let mut pipeline = Pipeline::new(formatter, vec![sink]);
 
     // Write-path errors are logged and recorded rather than propagated: returning early would skip

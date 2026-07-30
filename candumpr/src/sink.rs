@@ -1,11 +1,64 @@
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::recv::Timestamp;
-use crate::writer::Writer;
+use crate::writer::{FileWriter, StdoutWriter, Writer};
+
+/// Where a [Sink] writes.
+pub enum Output {
+    Stdout,
+    /// An exact user-given path, truncated if it already exists.
+    Path(PathBuf),
+    /// Parameters to fill in the default path template
+    Template {
+        dir: PathBuf,
+        interface: String,
+        /// File extension to use
+        ext: String,
+        /// Index of the next file to create
+        next_index: u64,
+    },
+}
+
+impl Output {
+    /// Construct the writer for this output type.
+    fn open(
+        &self,
+        timestamp: Timestamp,
+        flush_threshold_bytes: usize,
+    ) -> std::io::Result<Box<dyn Writer>> {
+        let path = match self {
+            Output::Stdout => return Ok(Box::new(StdoutWriter::new())),
+            Output::Path(path) => path.clone(),
+            Output::Template {
+                dir,
+                interface,
+                ext,
+                next_index,
+            } => dir.join(template_filename(
+                *next_index,
+                interface,
+                timestamp.sec,
+                ext,
+            )),
+        };
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::File::create(&path)?;
+        Ok(Box::new(std::io::BufWriter::with_capacity(
+            flush_threshold_bytes,
+            FileWriter::new(file),
+        )))
+    }
+}
 
 /// Configuration for a [Sink].
 pub struct SinkConfig {
+    pub output: Output,
     /// Format header written at activation, before the first frame.
     //
     // TODO: When the header includes dynamic data (like timestamp in ASC), we'll need to generate
@@ -17,8 +70,9 @@ pub struct SinkConfig {
 }
 
 impl SinkConfig {
-    pub fn new() -> SinkConfig {
+    pub fn new(output: Output) -> SinkConfig {
         SinkConfig {
+            output,
             header: None,
             flush_threshold_bytes: 64 * 1024,
             flush_interval: Some(Duration::from_secs(5)),
@@ -27,40 +81,30 @@ impl SinkConfig {
     }
 }
 
-impl Default for SinkConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// A [Sink] manages [Writer] operations to write formatted CAN frames to whatever writer is configured
 pub struct Sink {
-    pub(crate) writer: Box<dyn Writer>,
     config: SinkConfig,
     pub(crate) state: SinkState,
 }
 
 /// Lifecycle state of a [Sink].
 pub(crate) enum SinkState {
-    /// Writer exists, but no frame has been written yet
+    /// No writer exists; it is constructed from the output config on the first write.
     Pending,
     /// Writer exists and is writing
     Active {
+        writer: Box<dyn Writer>,
         bytes_since_flush: usize,
         last_flush: Instant,
         last_sync: Instant,
-        /// Timestamp of the first frame seen by this sink, captured at activation.
-        #[allow(dead_code)]
-        timestamp: Timestamp,
     },
     Closed,
 }
 
 impl Sink {
-    /// Construct a Sink in the Pending state with the given pre-built writer.
-    pub fn new<W: Writer + 'static>(writer: W, config: SinkConfig) -> Self {
+    /// Construct a Sink in the Pending state. Does no I/O.
+    pub fn new(config: SinkConfig) -> Self {
         Self {
-            writer: Box::new(writer),
             config,
             state: SinkState::Pending,
         }
@@ -78,23 +122,25 @@ impl Sink {
         let mut wrote = 0;
 
         if matches!(self.state, SinkState::Pending) {
+            let mut writer = self
+                .config
+                .output
+                .open(timestamp, self.config.flush_threshold_bytes)?;
             if let Some(header) = &self.config.header {
-                self.writer.write_all(header)?;
+                writer.write_all(header)?;
                 wrote += header.len();
             }
             let now = Instant::now();
             self.state = SinkState::Active {
+                writer,
                 bytes_since_flush: 0,
                 last_flush: now,
                 last_sync: now,
-                timestamp,
             };
         }
 
-        self.writer.write_all(bytes)?;
-        wrote += bytes.len();
-
         let SinkState::Active {
+            writer,
             bytes_since_flush,
             last_flush,
             ..
@@ -102,9 +148,11 @@ impl Sink {
         else {
             unreachable!("state must be Active after the Pending branch above");
         };
+        writer.write_all(bytes)?;
+        wrote += bytes.len();
         *bytes_since_flush += wrote;
         if *bytes_since_flush >= self.config.flush_threshold_bytes {
-            self.writer.flush()?;
+            writer.flush()?;
             *bytes_since_flush = 0;
             *last_flush = Instant::now();
         }
@@ -117,10 +165,10 @@ impl Sink {
     /// Should be called periodically
     pub fn tick(&mut self) -> eyre::Result<()> {
         let SinkState::Active {
+            writer,
             bytes_since_flush,
             last_flush,
             last_sync,
-            ..
         } = &mut self.state
         else {
             return Ok(());
@@ -131,7 +179,7 @@ impl Sink {
         if let Some(d) = self.config.sync_interval
             && now.duration_since(*last_sync) >= d
         {
-            self.writer.sync()?;
+            writer.sync()?;
             *bytes_since_flush = 0;
             *last_flush = now;
             *last_sync = now;
@@ -141,7 +189,7 @@ impl Sink {
         if let Some(d) = self.config.flush_interval
             && now.duration_since(*last_flush) >= d
         {
-            self.writer.flush()?;
+            writer.flush()?;
             *bytes_since_flush = 0;
             *last_flush = now;
         }
@@ -152,6 +200,7 @@ impl Sink {
     /// Flush the writer if Active; no-op otherwise.
     pub fn flush(&mut self) -> eyre::Result<()> {
         let SinkState::Active {
+            writer,
             bytes_since_flush,
             last_flush,
             ..
@@ -159,7 +208,7 @@ impl Sink {
         else {
             return Ok(());
         };
-        self.writer.flush()?;
+        writer.flush()?;
         *bytes_since_flush = 0;
         *last_flush = Instant::now();
         Ok(())
@@ -168,15 +217,15 @@ impl Sink {
     /// Sync the writer if Active; no-op otherwise
     pub fn sync(&mut self) -> eyre::Result<()> {
         let SinkState::Active {
+            writer,
             bytes_since_flush,
             last_flush,
             last_sync,
-            ..
         } = &mut self.state
         else {
             return Ok(());
         };
-        self.writer.sync()?;
+        writer.sync()?;
         *bytes_since_flush = 0;
         let now = Instant::now();
         *last_flush = now;
@@ -186,8 +235,8 @@ impl Sink {
 
     /// Finalize the writer and transition to Closed.
     pub fn close(&mut self) -> eyre::Result<()> {
-        let result = match self.state {
-            SinkState::Active { .. } => self.writer.finish(),
+        let result = match &mut self.state {
+            SinkState::Active { writer, .. } => writer.finish(),
             SinkState::Pending | SinkState::Closed => Ok(()),
         };
         self.state = SinkState::Closed;
@@ -215,9 +264,10 @@ fn template_filename(index: u64, interface: &str, sec: i64, ext: &str) -> String
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
     use crate::recv::Timestamp;
-    use crate::test_util::TestBufWriter;
 
     fn ts(sec: i64) -> Timestamp {
         Timestamp { sec, nsec: 0 }
@@ -250,45 +300,124 @@ mod tests {
         );
     }
 
-    fn sink(header: Option<Vec<u8>>) -> Sink {
-        let mut config = SinkConfig::new();
+    /// A Template-output Sink logging into `dir`, with time-based flush/sync disabled.
+    fn sink_in(dir: &TempDir, header: Option<Vec<u8>>) -> Sink {
+        let mut config = SinkConfig::new(Output::Template {
+            dir: dir.path().to_path_buf(),
+            interface: "can0".to_string(),
+            ext: "log".to_string(),
+            next_index: 0,
+        });
         config.header = header;
         config.flush_interval = None;
         config.sync_interval = None;
-        Sink::new(TestBufWriter::new(), config)
+        Sink::new(config)
     }
 
-    fn bytes_in(sink: &mut Sink) -> Vec<u8> {
-        sink.writer
-            .as_any_mut()
-            .downcast_mut::<TestBufWriter>()
+    fn entries(dir: &TempDir) -> Vec<std::path::PathBuf> {
+        let mut paths: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
-            .bytes
-            .clone()
+            .map(|e| e.unwrap().path())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// Contents of the single file in `dir`.
+    fn contents(dir: &TempDir) -> Vec<u8> {
+        let paths = entries(dir);
+        assert_eq!(paths.len(), 1, "expected exactly one file: {paths:?}");
+        std::fs::read(&paths[0]).unwrap()
+    }
+
+    #[test]
+    fn creation_deferred_until_first_write_then_named_from_first_frame() {
+        let dir = TempDir::new().unwrap();
+        let mut sink = sink_in(&dir, None);
+        assert!(entries(&dir).is_empty(), "Sink::new must do no I/O");
+
+        sink.write(b"PAYLOAD", ts(1732117385)).unwrap();
+        let paths = entries(&dir);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0].file_name().unwrap(),
+            "i0000_can0_2024-11-20T15-43-05Z.log"
+        );
     }
 
     #[test]
     fn header_written_on_activation() {
-        let mut sink = sink(Some(b"HDR".to_vec()));
+        let dir = TempDir::new().unwrap();
+        let mut sink = sink_in(&dir, Some(b"HDR".to_vec()));
         sink.write(b"PAYLOAD", ts(42)).unwrap();
         assert!(matches!(sink.state, SinkState::Active { .. }));
-        assert_eq!(bytes_in(&mut sink), b"HDRPAYLOAD");
+        sink.flush().unwrap();
+        assert_eq!(contents(&dir), b"HDRPAYLOAD");
+    }
+
+    #[test]
+    fn path_output_uses_name_verbatim_and_truncates() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("can.log");
+        std::fs::write(&path, b"LEFTOVER FROM AN EARLIER RUN").unwrap();
+
+        let mut config = SinkConfig::new(Output::Path(path.clone()));
+        config.flush_interval = None;
+        config.sync_interval = None;
+        let mut sink = Sink::new(config);
+        sink.write(b"PAYLOAD", ts(42)).unwrap();
+        sink.flush().unwrap();
+
+        assert_eq!(entries(&dir), vec![path.clone()]);
+        assert_eq!(std::fs::read(&path).unwrap(), b"PAYLOAD");
+    }
+
+    #[test]
+    fn writes_buffer_until_flush() {
+        let dir = TempDir::new().unwrap();
+        let mut sink = sink_in(&dir, None);
+        sink.write(b"PAYLOAD", ts(42)).unwrap();
+        assert_eq!(
+            contents(&dir),
+            b"",
+            "below the threshold, bytes stay buffered"
+        );
+        sink.flush().unwrap();
+        assert_eq!(contents(&dir), b"PAYLOAD");
+    }
+
+    #[test]
+    fn tick_flush_sync_are_noops_while_pending() {
+        let dir = TempDir::new().unwrap();
+        let mut sink = sink_in(&dir, None);
+        sink.tick().unwrap();
+        sink.flush().unwrap();
+        sink.sync().unwrap();
+        assert!(entries(&dir).is_empty());
     }
 
     #[test]
     fn write_after_close_on_active_returns_err() {
-        let mut sink = sink(None);
+        let dir = TempDir::new().unwrap();
+        let mut sink = sink_in(&dir, None);
         sink.write(b"PAYLOAD", ts(42)).unwrap();
         sink.close().unwrap();
         assert!(matches!(sink.state, SinkState::Closed));
+        // finish() flushed and synced: contents are complete without an explicit flush.
+        assert_eq!(contents(&dir), b"PAYLOAD");
         assert!(sink.write(b"MORE", ts(43)).is_err());
     }
 
     #[test]
     fn write_after_close_on_pending_returns_err() {
-        let mut sink = sink(None);
+        let dir = TempDir::new().unwrap();
+        let mut sink = sink_in(&dir, None);
         sink.close().unwrap();
         assert!(matches!(sink.state, SinkState::Closed));
         assert!(sink.write(b"PAYLOAD", ts(42)).is_err());
+        assert!(
+            entries(&dir).is_empty(),
+            "closing a Pending sink creates nothing"
+        );
     }
 }

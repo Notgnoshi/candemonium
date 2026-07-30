@@ -23,9 +23,6 @@ pub trait Writer: std::io::Write {
     ///
     /// Writes any epilogues, flush, and sync. Writes may not be performed after a finish.
     fn finish(&mut self) -> std::io::Result<()>;
-
-    #[cfg(test)]
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 impl<W: Writer + 'static> Writer for std::io::BufWriter<W> {
@@ -37,10 +34,5 @@ impl<W: Writer + 'static> Writer for std::io::BufWriter<W> {
     fn finish(&mut self) -> std::io::Result<()> {
         self.flush()?;
         self.get_mut().finish()
-    }
-
-    #[cfg(test)]
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
     }
 }
