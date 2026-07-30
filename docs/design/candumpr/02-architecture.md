@@ -86,7 +86,7 @@ The pipeline has four layers:
 | Layer     | Responsibility                                                                                                                                                                                                                                                              |
 | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Main loop | Recv batches from SPSC channel, call `pipeline.write_batch()`, recycle the batch Vec back to the receiver, call `pipeline.tick()` each iteration for time-driven flush/sync, forward SIGHUP via `pipeline.rotate()`, `pipeline.close()` on STOP                             |
-| Pipeline  | Owns one Formatter and a `Vec<Sink>` whose length is either 1 (single-file mode) or the number of interfaces (per-interface mode). Formats each frame into a per-Sink scratch buffer, then writes each non-empty buffer to its Sink once per batch.                         |
+| Pipeline  | Owns a `Vec` of output streams (pairs of Formatters and Sinks)                                                                                                                                                                                                              |
 | Sink      | Three-state machine (Pending/Active/Closed). Owns output path config, rotation config, retention config, header blob, file index. Handles deferred file creation, rotation decisions, retention cleanup. Constructs the Writer stack on activation. Terminal after `close`. |
 | Writers   | Composable, each wraps a generic inner Writer that extends `std::io::Write`.                                                                                                                                                                                                |
 
@@ -219,39 +219,19 @@ is specified separately.
 
 ## Pipeline detail
 
-The Pipeline owns a single Formatter, a `Vec<Sink>`, and one scratch format buffer per Sink.
+The Pipeline owns a `Vec` of output streams. Each stream pairs a Formatter with a Sink and carries
+one scratch format buffer.
 
-In per-interface mode (`-l` and daemon mode), `sinks.len() == n_interfaces` and frames are
-dispatched by `frame.sock_id`. In single-file mode (`-o`) and stdout mode, `sinks.len() == 1`, all
-traffic is interleaved into that single Sink, and `frame.sock_id` is used only by the Formatter (for
-the interface-name column in formats that need it), not for dispatch.
+The Pipeline can write to multiple streams (one stream per socket) or a single stream (all socket's
+traffic gets interleaved).
 
-On `write_batch(&[CanFrame])`:
-
-1. Clear each Sink's scratch buffer.
-2. For each frame in the batch, format it into the buffer of its target Sink: `sinks[sock_id]` in
-   per-interface mode, or `sinks[0]` in single-file mode.
-3. For each Sink with a non-empty buffer, call `sink.write(buf)` exactly once.
-
-This collapses every frame in the batch destined for a given Sink into a single `sink.write` call,
-preserving the invariant that each `sink.write` carries whole formatted frames. In single-sink mode
-that is one write per batch; in per-interface mode, one write per (interface, batch) pair.
-
-On `tick()`: forward to each Sink so it can check its `flush_interval` and `sync_interval` timers
-and call `writer.flush()` / `writer.sync()` if the corresponding timer has elapsed.
-
-On `take_rotated()`: return and clear the set of interface indices whose Sinks rotated during
-`write_batch()`. This allows the main loop to send address claim requests for interfaces that
-rotated due to size or duration limits.
+The Pipeline periodically `flush()` and `sync()`s data, to avoid losing data in the event of a power
+loss or crash.
 
 ## Formatter detail
 
-The Formatter converts a CanFrame into a byte array to be written. It is owned by the Pipeline, not
-by individual Sinks, and all configuration (interface names, timestamp mode, format) is provided at
-construction time. Its only mutable state is the relative-timestamp reference used by the delta and
-zero timestamp modes, so `format` takes `&mut self`.
-
-The Formatter trait has two methods:
+The Formatter converts a CanFrame into a byte array to be written. The Formatter trait has two
+methods:
 
 * `format(&mut self, frame: &CanFrame, buf: &mut Vec<u8>)` -- append the formatted frame to the
   buffer. The buffer may contain multiple frames. A frame is never split across multiple writes.

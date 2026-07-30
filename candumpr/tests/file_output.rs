@@ -25,18 +25,19 @@ fn entries(dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Wait for the log file to appear, and return everything in `dir` once it has.
+/// Wait for `count` log files to appear, and return everything in `dir` once they have.
 #[track_caller]
-fn wait_for_log_file(dir: &Path) -> Vec<PathBuf> {
+fn wait_for_log_files(dir: &Path, count: usize) -> Vec<PathBuf> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let paths = entries(dir);
-        if !paths.is_empty() {
+        if paths.len() >= count {
             return paths;
         }
         assert!(
             Instant::now() < deadline,
-            "candumpr created no log file in {dir:?}"
+            "candumpr created {} of {count} log files in {dir:?}",
+            paths.len()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -62,7 +63,7 @@ fn logs_one_interface_to_a_scheme_named_file() {
     let tx = can::open_can_raw_blocking(iface).unwrap();
     can::send_frame(tx.as_fd(), &LinuxCanFrame::new(0x123, &[0xAB])).unwrap();
 
-    let paths = wait_for_log_file(dir.path()); // panics on timeout
+    let paths = wait_for_log_files(dir.path(), 1); // panics on timeout
 
     child.signal(libc::SIGTERM).unwrap();
     let output = child.captured_output().unwrap();
@@ -123,7 +124,7 @@ fn interleaves_multiple_interfaces_to_one_file() {
     can::send_frame(tx1.as_fd(), &LinuxCanFrame::new(0x123, &[0xAB])).unwrap();
     can::send_frame(tx2.as_fd(), &LinuxCanFrame::new(0x456, &[0xCD])).unwrap();
 
-    let paths = wait_for_log_file(dir.path()); // panics on timeout
+    let paths = wait_for_log_files(dir.path(), 1); // panics on timeout
 
     child.signal(libc::SIGTERM).unwrap();
     let output = child.captured_output().unwrap();
@@ -139,4 +140,60 @@ fn interleaves_multiple_interfaces_to_one_file() {
     let log = std::fs::read_to_string(&paths[0]).unwrap();
     assert!(log.contains(&format!("{iface1} 123#AB\n")));
     assert!(log.contains(&format!("{iface2} 456#CD\n")));
+}
+
+#[test]
+#[cfg_attr(feature = "ci", ignore = "requires vcan")]
+fn logs_each_interface_to_its_own_file() {
+    let vcans = VcanHarness::new(2).unwrap();
+    let iface1 = &vcans.names()[0];
+    let iface2 = &vcans.names()[1];
+    let dir = tempfile::TempDir::new().unwrap();
+
+    let child = tool!("candumpr")
+        .args(["-l", "--timestamp", "zero"])
+        .arg(iface1)
+        .arg(iface2)
+        .current_dir(dir.path())
+        .spawn_piped()
+        .unwrap();
+
+    // Give enough time for candumpr to create its socket and start receiving
+    std::thread::sleep(Duration::from_millis(200));
+
+    let tx1 = can::open_can_raw_blocking(iface1).unwrap();
+    let tx2 = can::open_can_raw_blocking(iface2).unwrap();
+    can::send_frame(tx1.as_fd(), &LinuxCanFrame::new(0x123, &[0xAB])).unwrap();
+    // Separate the two frames in time, to attempt to prove that each interface has its own relative
+    // timestamping.
+    std::thread::sleep(Duration::from_millis(150));
+    can::send_frame(tx2.as_fd(), &LinuxCanFrame::new(0x456, &[0xCD])).unwrap();
+
+    let paths = wait_for_log_files(dir.path(), 2); // panics on timeout
+
+    child.signal(libc::SIGTERM).unwrap();
+    let output = child.captured_output().unwrap();
+    assert!(
+        output.status.success(),
+        "expected a clean exit, got {}",
+        output.status
+    );
+
+    assert_eq!(paths.len(), 2, "expected exactly two log files: {paths:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+
+    for (iface, frame) in [(iface1, "123#AB"), (iface2, "456#CD")] {
+        let prefix = format!("i0000_{iface}_");
+        let path = paths
+            .iter()
+            .find(|p| {
+                let name = p.file_name().unwrap().to_str().unwrap();
+                name.starts_with(&prefix) && name.ends_with(".log")
+            })
+            .unwrap_or_else(|| panic!("expected a {prefix}*.log file, got {paths:?}"));
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            format!("(000.000000) {iface} {frame}\n")
+        );
+    }
 }

@@ -15,6 +15,9 @@ use candumpr::recv::receiver::{BATCH_CAPACITY, Receiver};
 use candumpr::sink::{Output, Sink, SinkConfig};
 use clap::Parser;
 use crossbeam_channel::select;
+use tracing_subscriber::filter::Targets;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -86,6 +89,15 @@ fn log_error_frames(batch: &[CanFrame], bus_state: &mut [BusState], names: &[Str
     bus_off
 }
 
+/// The first interface name that appears more than once.
+fn first_duplicate(interfaces: &[String]) -> Option<&str> {
+    let mut seen = std::collections::HashSet::new();
+    interfaces
+        .iter()
+        .find(|name| !seen.insert(name.as_str()))
+        .map(String::as_str)
+}
+
 /// Output format for received frames.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum Format {
@@ -113,9 +125,7 @@ struct Cli {
     #[arg(required = true)]
     interfaces: Vec<String>,
 
-    /// Log to a file in the current directory, instead of stdout.
-    ///
-    /// TODO: Accepts exactly one interface (for now).
+    /// Log each interface to its own file in the current directory, instead of stdout.
     #[arg(long, short = 'l', conflicts_with = "output")]
     log: bool,
 
@@ -143,14 +153,21 @@ fn main() -> ExitCode {
     }
     let cli = Cli::parse();
 
+    // neli SPAMS netlink event logs on startup.
+    let filter = Targets::new()
+        .with_default(cli.log_level)
+        .with_target("neli", tracing::Level::WARN);
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_max_level(cli.log_level)
+        .finish()
+        .with(filter)
         .init();
 
-    // TODO: Add multiple interface support for --log
-    if cli.log && cli.interfaces.len() > 1 {
-        unimplemented!("--log does not yet support multiple interfaces");
+    // A repeated interface would log every frame on it twice, and in --log mode its two Sinks would
+    // race to create and truncate the same scheme-named file.
+    if let Some(duplicate) = first_duplicate(&cli.interfaces) {
+        tracing::error!(interface = %duplicate, "interface given more than once");
+        return ExitCode::FAILURE;
     }
 
     // The sockets vector defines the canonical interface ordering. The orderings of:
@@ -217,28 +234,44 @@ fn main() -> ExitCode {
     // Last logged bus state per sock_id, so we log only transitions.
     let mut bus_state: Vec<BusState> = vec![BusState::default(); names.len()];
 
-    let formatter: Box<dyn Formatter> = match cli.format {
-        Format::CandumpFile => Box::new(CanutilsFileFormatter::new(cli.interfaces, cli.timestamp)),
-        Format::CandumpConsole => {
-            Box::new(CanutilsConsoleFormatter::new(cli.interfaces, cli.timestamp))
+    let make_formatter = || -> Box<dyn Formatter> {
+        match cli.format {
+            Format::CandumpFile => {
+                Box::new(CanutilsFileFormatter::new(names.clone(), cli.timestamp))
+            }
+            Format::CandumpConsole => {
+                Box::new(CanutilsConsoleFormatter::new(names.clone(), cli.timestamp))
+            }
         }
     };
-    let output = if cli.log {
-        Output::Template {
-            dir: ".".into(),
-            interface: names[0].clone(),
-            ext: cli.format.ext().to_string(),
-            next_index: 0,
-        }
+
+    // --log gives every interface its own output, so its traffic lands in its own file. Everything
+    // else interleaves all interfaces into one output.
+    let outputs: Vec<Output> = if cli.log {
+        names
+            .iter()
+            .map(|interface| Output::Template {
+                dir: ".".into(),
+                interface: interface.clone(),
+                ext: cli.format.ext().to_string(),
+                next_index: 0,
+            })
+            .collect()
     } else if let Some(path) = cli.output {
-        Output::Path(path)
+        vec![Output::Path(path)]
     } else {
-        Output::Stdout
+        vec![Output::Stdout]
     };
-    let mut sink_config = SinkConfig::new(output);
-    sink_config.header = formatter.header().map(|h| h.to_vec());
-    let sink = Sink::new(sink_config);
-    let mut pipeline = Pipeline::new(formatter, vec![sink]);
+    let streams = outputs
+        .into_iter()
+        .map(|output| {
+            let formatter = make_formatter();
+            let mut config = SinkConfig::new(output);
+            config.header = formatter.header().map(|h| h.to_vec());
+            (formatter, Sink::new(config))
+        })
+        .collect();
+    let mut pipeline = Pipeline::new(streams);
 
     // Write-path errors are logged and recorded rather than propagated: returning early would skip
     // draining the remaining batches and closing the pipeline, both of which can lose buffered data.

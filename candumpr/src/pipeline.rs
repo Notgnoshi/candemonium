@@ -3,60 +3,67 @@ use crate::frame::CanFrame;
 use crate::recv::Timestamp;
 use crate::sink::Sink;
 
-/// Orchestrates formatting batches of [CanFrame]s and then writing them to each [Sink]
-pub struct Pipeline {
+/// One output stream: the [Formatter] for it, its [Sink], and the scratch state for the batch being
+/// written.
+struct Stream {
     formatter: Box<dyn Formatter>,
-    pub(crate) sinks: Vec<Sink>,
-    bufs: Vec<Vec<u8>>,
-    first_ts: Vec<Option<Timestamp>>,
+    sink: Sink,
+    buf: Vec<u8>,
+    first_ts: Option<Timestamp>,
+}
+
+/// Orchestrates formatting batches of [CanFrame]s and then writing them to each output stream
+pub struct Pipeline {
+    streams: Vec<Stream>,
 }
 
 impl Pipeline {
-    /// Construct a Pipeline over a non-empty set of sinks.
+    /// Construct a Pipeline over a non-empty set of output streams.
     ///
-    /// There should either be one sink, or a sink for every CAN interface being logged.
-    pub fn new(formatter: Box<dyn Formatter>, sinks: Vec<Sink>) -> Self {
-        assert!(!sinks.is_empty(), "Pipeline requires at least one Sink");
-        let n = sinks.len();
-        let bufs = (0..n).map(|_| Vec::with_capacity(4096)).collect();
-        let first_ts = vec![None; n];
-        Self {
-            formatter,
-            sinks,
-            bufs,
-            first_ts,
-        }
+    /// There should either be one stream, or a stream for every CAN interface being logged.
+    pub fn new(streams: Vec<(Box<dyn Formatter>, Sink)>) -> Self {
+        assert!(
+            !streams.is_empty(),
+            "Pipeline requires at least one output stream"
+        );
+        let streams = streams
+            .into_iter()
+            .map(|(formatter, sink)| Stream {
+                formatter,
+                sink,
+                buf: Vec::with_capacity(4096),
+                first_ts: None,
+            })
+            .collect();
+        Self { streams }
     }
 
-    /// Write the given batch of [CanFrame]s to the [Sink]s
+    /// Write the given batch of [CanFrame]s to the output streams
     ///
-    /// With a single sink, every frame is routed to it regardless of interface index; this is both
-    /// the common stdout case and what keeps a frame's [CanFrame::sock_id] from indexing past the
-    /// only buffer. With multiple sinks, frames are dispatched by interface index.
+    /// With a single stream, every frame is routed to it regardless of interface index. With
+    /// multiple streams, frames are dispatched by interface index.
     pub fn write_batch(&mut self, frames: &[CanFrame]) -> eyre::Result<()> {
-        for buf in &mut self.bufs {
-            buf.clear();
-        }
-        for slot in &mut self.first_ts {
-            *slot = None;
+        for stream in &mut self.streams {
+            stream.buf.clear();
+            stream.first_ts = None;
         }
 
-        let single = self.sinks.len() == 1;
+        let single = self.streams.len() == 1;
         for frame in frames {
-            let idx = if single { 0 } else { frame.sock_id };
-            if self.first_ts[idx].is_none() {
-                self.first_ts[idx] = Some(frame.timestamp);
+            let stream = &mut self.streams[if single { 0 } else { frame.sock_id }];
+            if stream.first_ts.is_none() {
+                stream.first_ts = Some(frame.timestamp);
             }
-            self.formatter.format(frame, &mut self.bufs[idx]);
+            stream.formatter.format(frame, &mut stream.buf);
         }
 
         let mut first_err: Option<eyre::Report> = None;
-        for (i, (sink, buf)) in self.sinks.iter_mut().zip(self.bufs.iter()).enumerate() {
-            if buf.is_empty() {
+        for stream in &mut self.streams {
+            if stream.buf.is_empty() {
                 continue;
             }
-            // first_ts[i] is Some whenever bufs[i] is non-empty: both are written together above.
-            if let Err(e) = sink.write(buf, self.first_ts[i].unwrap()) {
+            // first_ts is Some whenever buf is non-empty: both are written together above.
+            if let Err(e) = stream.sink.write(&stream.buf, stream.first_ts.unwrap()) {
                 match &first_err {
                     None => first_err = Some(e),
                     Some(_) => tracing::error!(error = ?e, "sink write failed"),
@@ -91,8 +98,8 @@ impl Pipeline {
         mut op: impl FnMut(&mut Sink) -> eyre::Result<()>,
     ) -> eyre::Result<()> {
         let mut first_err: Option<eyre::Report> = None;
-        for sink in &mut self.sinks {
-            if let Err(e) = op(sink) {
+        for stream in &mut self.streams {
+            if let Err(e) = op(&mut stream.sink) {
                 match &first_err {
                     None => first_err = Some(e),
                     Some(_) => tracing::error!(error = ?e, "sink operation failed"),
@@ -157,13 +164,13 @@ mod tests {
             "can3".to_string(),
         ];
         let dir = TempDir::new().unwrap();
-        let mut pipeline = Pipeline::new(
+        let mut pipeline = Pipeline::new(vec![(
             Box::new(CanutilsFileFormatter::new(
                 names.clone(),
                 TimestampMode::Absolute,
             )),
-            vec![sink(&dir, 0)],
-        );
+            sink(&dir, 0),
+        )]);
 
         let frames = vec![frame(0, 0x100, &[0x01]), frame(3, 0x200, &[0x02])];
         pipeline.write_batch(&frames).unwrap();
@@ -177,14 +184,16 @@ mod tests {
     fn per_interface_dispatches_by_sock_id() {
         let names = vec!["can0".to_string(), "can1".to_string(), "can2".to_string()];
         let dir = TempDir::new().unwrap();
-        let sinks = vec![sink(&dir, 0), sink(&dir, 1), sink(&dir, 2)];
-        let mut pipeline = Pipeline::new(
-            Box::new(CanutilsFileFormatter::new(
-                names.clone(),
-                TimestampMode::Absolute,
-            )),
-            sinks,
-        );
+        let streams = (0..3)
+            .map(|i| {
+                let formatter: Box<dyn Formatter> = Box::new(CanutilsFileFormatter::new(
+                    names.clone(),
+                    TimestampMode::Absolute,
+                ));
+                (formatter, sink(&dir, i))
+            })
+            .collect();
+        let mut pipeline = Pipeline::new(streams);
 
         let frames = vec![
             frame(0, 0x100, &[0x0A]),
