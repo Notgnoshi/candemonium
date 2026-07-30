@@ -1,13 +1,16 @@
 use std::os::unix::io::AsFd;
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use candumpr::can::{self, LinuxCanFrame};
 use vcan_fixture::VcanHarness;
+use vcan_fixture::prelude::*;
 
 #[ctor::ctor]
 fn setup() {
-    tracing_subscriber::fmt().with_test_writer().init();
+    tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_ansi(true)
+        .init();
     vcan_fixture::enter_namespace();
 }
 
@@ -17,13 +20,7 @@ fn rides_through_link_down_and_resumes() {
     let vcans = VcanHarness::new(1).unwrap();
     let iface = vcans.names()[0].clone();
 
-    let child = Command::new(env!("CARGO_BIN_EXE_candumpr"))
-        .arg("--log-level=INFO")
-        .arg(&iface)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child = tool!("candumpr", "INFO").arg(&iface).spawn_piped().unwrap();
 
     // Let the netlink monitor connect and dump the initial (up) state.
     std::thread::sleep(Duration::from_millis(400));
@@ -42,14 +39,10 @@ fn rides_through_link_down_and_resumes() {
     .unwrap();
     std::thread::sleep(Duration::from_millis(250));
 
-    unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
-    }
-    let output = child.wait_with_output().unwrap();
+    child.signal(libc::SIGINT).unwrap();
+    let output = child.captured_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    eprint!("{stderr}");
-    print!("{stdout}");
 
     assert!(
         stderr.contains("interface link down"),

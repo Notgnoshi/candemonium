@@ -52,6 +52,14 @@ pub mod bench;
 pub mod cmd;
 mod netlink;
 
+/// The traits and macros tests need to spawn and signal a tool binary.
+pub mod prelude {
+    pub use assert_cmd::prelude::OutputAssertExt;
+
+    pub use crate::cmd::{ChildExt, CommandExt};
+    pub use crate::tool;
+}
+
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::{fs, io};
 
