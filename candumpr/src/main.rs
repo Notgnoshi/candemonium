@@ -15,6 +15,9 @@ use candumpr::recv::receiver::{BATCH_CAPACITY, Receiver};
 use candumpr::sink::{Output, Sink, SinkConfig};
 use clap::Parser;
 use crossbeam_channel::select;
+use tracing_subscriber::filter::Targets;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -150,9 +153,14 @@ fn main() -> ExitCode {
     }
     let cli = Cli::parse();
 
+    // neli SPAMS netlink event logs on startup.
+    let filter = Targets::new()
+        .with_default(cli.log_level)
+        .with_target("neli", tracing::Level::WARN);
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_max_level(cli.log_level)
+        .finish()
+        .with(filter)
         .init();
 
     // A repeated interface would log every frame on it twice, and in --log mode its two Sinks would

@@ -150,10 +150,7 @@ fn logs_each_interface_to_its_own_file() {
     let iface2 = &vcans.names()[1];
     let dir = tempfile::TempDir::new().unwrap();
 
-    // INFO, not the tool!() default of TRACE: this test needs candumpr to keep making progress
-    // while it runs, and at TRACE the netlink dump's logging fills the stderr pipe that nothing
-    // drains until the child exits, blocking candumpr's writer thread mid-run.
-    let child = tool!("candumpr", "INFO")
+    let child = tool!("candumpr")
         .args(["-l", "--timestamp", "zero"])
         .arg(iface1)
         .arg(iface2)
