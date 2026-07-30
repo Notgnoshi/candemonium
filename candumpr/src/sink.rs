@@ -49,6 +49,7 @@ impl Output {
             std::fs::create_dir_all(parent)?;
         }
         let file = std::fs::File::create(&path)?;
+        tracing::info!(path = %path.display(), "created log file");
         Ok(Box::new(std::io::BufWriter::with_capacity(
             flush_threshold_bytes,
             FileWriter::new(file),
