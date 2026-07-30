@@ -1,4 +1,5 @@
 use std::os::unix::io::AsFd;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -94,6 +95,16 @@ enum Format {
     CandumpConsole,
 }
 
+impl Format {
+    /// Log file extension for each output format
+    fn ext(&self) -> &'static str {
+        match self {
+            Format::CandumpFile => "log",
+            Format::CandumpConsole => "txt",
+        }
+    }
+}
+
 /// Log CAN traffic from multiple networks.
 #[derive(Parser)]
 #[command(version)]
@@ -101,6 +112,16 @@ struct Cli {
     /// CAN interfaces to listen on.
     #[arg(required = true)]
     interfaces: Vec<String>,
+
+    /// Log to a file in the current directory, instead of stdout.
+    ///
+    /// TODO: Accepts exactly one interface (for now).
+    #[arg(long, short = 'l', conflicts_with = "output")]
+    log: bool,
+
+    /// Log to this file path. Truncated if it already exists.
+    #[arg(long, short = 'o', value_name = "FILE")]
+    output: Option<PathBuf>,
 
     /// Output format for received frames.
     #[arg(long, value_enum, default_value = "candump-file")]
@@ -126,6 +147,11 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .with_max_level(cli.log_level)
         .init();
+
+    // TODO: Add multiple interface support for --log
+    if cli.log && cli.interfaces.len() > 1 {
+        unimplemented!("--log does not yet support multiple interfaces");
+    }
 
     // The sockets vector defines the canonical interface ordering. The orderings of:
     //
@@ -197,7 +223,19 @@ fn main() -> ExitCode {
             Box::new(CanutilsConsoleFormatter::new(cli.interfaces, cli.timestamp))
         }
     };
-    let mut sink_config = SinkConfig::new(Output::Stdout);
+    let output = if cli.log {
+        Output::Template {
+            dir: ".".into(),
+            interface: names[0].clone(),
+            ext: cli.format.ext().to_string(),
+            next_index: 0,
+        }
+    } else if let Some(path) = cli.output {
+        Output::Path(path)
+    } else {
+        Output::Stdout
+    };
+    let mut sink_config = SinkConfig::new(output);
     sink_config.header = formatter.header().map(|h| h.to_vec());
     let sink = Sink::new(sink_config);
     let mut pipeline = Pipeline::new(formatter, vec![sink]);
