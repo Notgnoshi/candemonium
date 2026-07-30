@@ -1,14 +1,17 @@
 use std::io::{BufRead, BufReader};
 use std::os::unix::io::AsFd;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use candumpr::can::{self, LinuxCanFrame};
 use vcan_fixture::VcanHarness;
+use vcan_fixture::prelude::*;
 
 #[ctor::ctor]
 fn setup() {
-    tracing_subscriber::fmt().with_test_writer().init();
+    tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_ansi(true)
+        .init();
     vcan_fixture::enter_namespace();
 }
 
@@ -20,13 +23,8 @@ fn exits_cleanly_when_stdout_closes() {
     let vcans = VcanHarness::new(1).unwrap();
     let iface = &vcans.names()[0];
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_candumpr"))
-        .arg(iface)
-        .arg("--log-level=INFO") // TRACE level fills up the stderr buf and prevents EPIPE error
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    // TRACE log level fills up the stderr buf and prevents EPIPE error from being raised
+    let mut child = tool!("candumpr", "INFO").arg(iface).spawn_piped().unwrap();
 
     // Give the process time to set up io_uring and start receiving.
     std::thread::sleep(Duration::from_millis(200));
