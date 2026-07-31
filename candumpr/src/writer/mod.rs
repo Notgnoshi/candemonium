@@ -1,10 +1,12 @@
 mod file;
 mod stdout;
+mod zstd;
 
 use std::io::Write;
 
 pub use file::FileWriter;
 pub use stdout::StdoutWriter;
+pub use zstd::ZstdWriter;
 
 /// Writes formatted frame data to an output destination.
 pub trait Writer: std::io::Write {
