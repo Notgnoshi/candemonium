@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::recv::Timestamp;
-use crate::writer::{FileWriter, StdoutWriter, Writer};
+use crate::writer::{FileWriter, StdoutWriter, Writer, ZstdWriter};
 
 /// Where a [Sink] writes.
 pub enum Output {
@@ -21,14 +21,40 @@ pub enum Output {
     },
 }
 
-impl Output {
-    /// Construct the writer for this output type.
-    fn open(
-        &self,
-        timestamp: Timestamp,
-        flush_threshold_bytes: usize,
-    ) -> std::io::Result<Box<dyn Writer>> {
-        let path = match self {
+/// Configuration for a [Sink].
+pub struct SinkConfig {
+    pub output: Output,
+    /// Format header written at activation, before the first frame.
+    //
+    // TODO: When the header includes dynamic data (like timestamp in ASC), we'll need to generate
+    // the header on the first formatted frame the sink receives from the formatter.
+    pub header: Option<Vec<u8>>,
+    pub flush_threshold_bytes: usize,
+    pub flush_interval: Option<Duration>,
+    pub sync_interval: Option<Duration>,
+    /// Whether activation failures that waiting could heal are retried, or should be fatal.
+    pub retry_activation_failures: bool,
+    /// Compress file output with zstd. Ignored for [Output::Stdout].
+    pub compress: bool,
+}
+
+impl SinkConfig {
+    pub fn new(output: Output) -> SinkConfig {
+        SinkConfig {
+            output,
+            header: None,
+            flush_threshold_bytes: 64 * 1024,
+            flush_interval: Some(Duration::from_secs(5)),
+            sync_interval: Some(Duration::from_secs(5 * 60)),
+            retry_activation_failures: false,
+            compress: false,
+        }
+    }
+
+    /// Construct the writer stack for this config's output.
+    fn open_writer(&self, timestamp: Timestamp) -> std::io::Result<Box<dyn Writer>> {
+        let path = match &self.output {
+            // Unreachable with compression: main rejects --compress against stdout.
             Output::Stdout => return Ok(Box::new(StdoutWriter::new())),
             Output::Path(path) => path.clone(),
             Output::Template {
@@ -48,39 +74,15 @@ impl Output {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::File::create(&path)?;
+        let file = FileWriter::new(std::fs::File::create(&path)?);
         tracing::info!(path = %path.display(), "created log file");
-        Ok(Box::new(std::io::BufWriter::with_capacity(
-            flush_threshold_bytes,
-            FileWriter::new(file),
-        )))
-    }
-}
-
-/// Configuration for a [Sink].
-pub struct SinkConfig {
-    pub output: Output,
-    /// Format header written at activation, before the first frame.
-    //
-    // TODO: When the header includes dynamic data (like timestamp in ASC), we'll need to generate
-    // the header on the first formatted frame the sink receives from the formatter.
-    pub header: Option<Vec<u8>>,
-    pub flush_threshold_bytes: usize,
-    pub flush_interval: Option<Duration>,
-    pub sync_interval: Option<Duration>,
-    /// Whether activation failures that waiting could heal are retried, or should be fatal.
-    pub retry_activation_failures: bool,
-}
-
-impl SinkConfig {
-    pub fn new(output: Output) -> SinkConfig {
-        SinkConfig {
-            output,
-            header: None,
-            flush_threshold_bytes: 64 * 1024,
-            flush_interval: Some(Duration::from_secs(5)),
-            sync_interval: Some(Duration::from_secs(5 * 60)),
-            retry_activation_failures: false,
+        if self.compress {
+            Ok(Box::new(ZstdWriter::new(file)?))
+        } else {
+            Ok(Box::new(std::io::BufWriter::with_capacity(
+                self.flush_threshold_bytes,
+                file,
+            )))
         }
     }
 }
@@ -151,11 +153,7 @@ impl Sink {
             self.state = SinkState::Pending {
                 last_attempt: Some(Instant::now()),
             };
-            let mut writer = match self
-                .config
-                .output
-                .open(timestamp, self.config.flush_threshold_bytes)
-            {
+            let mut writer = match self.config.open_writer(timestamp) {
                 Ok(writer) => writer,
                 Err(e) => {
                     if classify(e.kind(), self.config.retry_activation_failures)
