@@ -109,10 +109,12 @@ enum Format {
 
 impl Format {
     /// Log file extension for each output format
-    fn ext(&self) -> &'static str {
-        match self {
-            Format::CandumpFile => "log",
-            Format::CandumpConsole => "txt",
+    fn ext(&self, compress: bool) -> &'static str {
+        match (self, compress) {
+            (Format::CandumpFile, false) => "log",
+            (Format::CandumpFile, true) => "log.zst",
+            (Format::CandumpConsole, false) => "txt",
+            (Format::CandumpConsole, true) => "txt.zst",
         }
     }
 }
@@ -136,6 +138,10 @@ struct Cli {
     /// Output format for received frames.
     #[arg(long, value_enum, default_value = "candump-file")]
     format: Format,
+
+    /// Compress output with zstd. Requires --log or --output.
+    #[arg(long, short = 'c')]
+    compress: bool,
 
     /// Timestamp rendering mode. Only applies to the candump formats.
     #[arg(long, value_enum, default_value = "absolute")]
@@ -168,6 +174,23 @@ fn main() -> ExitCode {
     if let Some(duplicate) = first_duplicate(&cli.interfaces) {
         tracing::error!(interface = %duplicate, "interface given more than once");
         return ExitCode::FAILURE;
+    }
+
+    // Compressing stdout would hand a terminal a binary stream, and the pipe case is served just as
+    // well by `candumpr can0 | zstd`.
+    if cli.compress && !cli.log && cli.output.is_none() {
+        tracing::error!("--compress requires --log or --output");
+        return ExitCode::FAILURE;
+    }
+    if let Some(path) = &cli.output
+        && cli.compress
+        && path.extension().is_none_or(|ext| ext != "zst")
+    {
+        // File extensions are useful, but not required. Give a QoL warning.
+        tracing::warn!(
+            path = %path.display(),
+            "output is zstd-compressed but the path does not end in .zst"
+        );
     }
 
     // The sockets vector defines the canonical interface ordering. The orderings of:
@@ -253,7 +276,7 @@ fn main() -> ExitCode {
             .map(|interface| Output::Template {
                 dir: ".".into(),
                 interface: interface.clone(),
-                ext: cli.format.ext().to_string(),
+                ext: cli.format.ext(cli.compress).to_string(),
                 next_index: 0,
             })
             .collect()
@@ -268,6 +291,7 @@ fn main() -> ExitCode {
             let formatter = make_formatter();
             let mut config = SinkConfig::new(output);
             config.header = formatter.header().map(|h| h.to_vec());
+            config.compress = cli.compress;
             (formatter, Sink::new(config))
         })
         .collect();
