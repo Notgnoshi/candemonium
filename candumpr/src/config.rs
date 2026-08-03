@@ -136,6 +136,9 @@ impl<'de> serde::Deserialize<'de> for Interval {
 /// Per-interface TOML settings.
 ///
 /// This is the `[defaults]` and each `[interface.<name>]` table.
+//
+// NOTE: As more fields are added, please keep the `docs/user/candumpr-configuration.md` document
+// up-to-date.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(default)]
 struct RawStreamConfig {
