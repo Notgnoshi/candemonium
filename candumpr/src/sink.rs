@@ -2,6 +2,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::config::Rotation;
 use crate::recv::Timestamp;
 use crate::template;
 use crate::writer::{FileWriter, StdoutWriter, Writer, ZstdWriter};

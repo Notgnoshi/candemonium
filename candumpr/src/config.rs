@@ -40,7 +40,7 @@ impl Format {
 }
 
 /// Log CAN traffic from multiple networks.
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(version)]
 pub struct Cli {
     /// CAN interfaces to listen on.
@@ -81,6 +81,10 @@ pub struct Cli {
     )]
     pub timestamp: TimestampMode,
 
+    /// Rotate the log when it exceeds a size ("100MB") or an age ("30min"). "off" disables.
+    #[arg(long, value_name = "LIMIT", requires = "log", default_value = "30 minutes", conflicts_with_all = ["output", "daemon"])]
+    pub rotation: Rotation,
+
     /// Log level for tracing output on stderr.
     #[arg(long, default_value = "INFO")]
     pub log_level: tracing::Level,
@@ -109,6 +113,59 @@ pub struct StreamConfig {
     pub compress: bool,
     pub flush_interval: Option<Duration>,
     pub sync_interval: Option<Duration>,
+    pub rotation: Rotation,
+}
+
+/// A log rotation trigger.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Rotation {
+    #[default]
+    Off,
+    /// Number of bytes written to disk
+    Size(u64),
+    /// Time since file was opened
+    Interval(Duration),
+}
+
+impl std::str::FromStr for Rotation {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("off") {
+            return Ok(Rotation::Off);
+        }
+        // A bare number is rejected rather than silently meaning bytes: bytesize would take it,
+        // and "100" is far more likely to be a forgotten unit than a 100 byte limit.
+        if raw.ends_with(['b', 'B']) {
+            let size = raw
+                .parse::<bytesize::ByteSize>()
+                .map_err(|e| format!("invalid rotation size {raw:?}: {e}"))?
+                .as_u64();
+            if size < 100 {
+                return Err(format!("rotation size must be bigger than {raw:?}"));
+            }
+            return Ok(Rotation::Size(size));
+        }
+        let signed: jiff::SignedDuration = raw.parse().map_err(|_| {
+            format!(
+                "expected a size like \"100MB\", a duration like \"30min\", or \"off\", got {raw:?}"
+            )
+        })?;
+        let duration = Duration::try_from(signed)
+            .map_err(|_| format!("rotation duration must not be negative, got {raw:?}"))?;
+        if duration.is_zero() {
+            return Err(format!("rotation duration must not be zero, got {raw:?}"));
+        }
+        Ok(Rotation::Interval(duration))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Rotation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 /// A flush or sync interval; a duration, or `"off"`.
@@ -150,6 +207,7 @@ struct RawStreamConfig {
     directory: Option<PathBuf>,
     flush_interval: Interval,
     sync_interval: Interval,
+    rotation: Rotation,
 }
 
 impl Default for RawStreamConfig {
@@ -161,6 +219,7 @@ impl Default for RawStreamConfig {
             directory: None,
             flush_interval: Interval(Some(DEFAULT_FLUSH_INTERVAL)),
             sync_interval: Interval(Some(DEFAULT_SYNC_INTERVAL)),
+            rotation: Rotation::Interval(Duration::from_secs(30 * 60)),
         }
     }
 }
@@ -181,9 +240,6 @@ struct Raw {
 }
 
 /// Layer `over` onto `base`: every key in `over` replaces the same key in `base`.
-///
-/// TODO: This currently does shallow overlay. Once we get nested tables (as would be the case for
-/// the rotation and retention configs) we'll need to reassess.
 fn overlay(base: &toml::Table, over: &toml::Table) -> toml::Table {
     let mut merged = base.clone();
     for (key, value) in over {
@@ -260,6 +316,7 @@ impl Config {
                 compress: cli.compress,
                 flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
                 sync_interval: Some(DEFAULT_SYNC_INTERVAL),
+                rotation: cli.rotation,
             })
             .collect();
 
@@ -337,6 +394,7 @@ impl Config {
                 compress: settings.compress,
                 flush_interval: settings.flush_interval.0,
                 sync_interval: settings.sync_interval.0,
+                rotation: settings.rotation,
             });
         }
 
@@ -362,6 +420,7 @@ mod tests {
             compress = false
             timestamp = "delta"
             sync_interval = "off"
+            rotation = "100MB"
 
             [interface.can1]
 
@@ -369,6 +428,7 @@ mod tests {
             compress = true
             format = "candump-console"
             flush_interval = "250ms"
+            rotation = "off"
         "#;
         let config = Config::from_toml(src).unwrap();
 
@@ -388,6 +448,8 @@ mod tests {
                     compress: true,
                     flush_interval: Some(Duration::from_millis(250)),
                     sync_interval: None,
+                    // Overrides the inherited size, exactly like `flush_interval = "off"` next door.
+                    rotation: Rotation::Off,
                 },
                 StreamConfig {
                     output: Output::Template {
@@ -400,6 +462,7 @@ mod tests {
                     compress: false,
                     flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
                     sync_interval: None,
+                    rotation: Rotation::Size(100_000_000),
                 },
             ]
         );
@@ -434,6 +497,60 @@ mod tests {
         assert!(err.contains("expected a duration like"), "got: {err}");
         let err = format!("{:#}", flush_interval("-3s").unwrap_err());
         assert!(err.contains("must not be negative"), "got: {err}");
+    }
+
+    #[test]
+    fn rotation_tells_sizes_and_durations_apart() {
+        fn rotation(value: &str) -> Result<Rotation, String> {
+            value.parse()
+        }
+        fn size(bytes: u64) -> Result<Rotation, String> {
+            Ok(Rotation::Size(bytes))
+        }
+        fn secs(secs: u64) -> Result<Rotation, String> {
+            Ok(Rotation::Interval(Duration::from_secs(secs)))
+        }
+
+        // The two that pin the discriminator: a trailing `b` is the only difference.
+        assert_eq!(rotation("1m"), secs(60));
+        assert_eq!(rotation("1MB"), size(1_000_000));
+
+        assert_eq!(rotation("100MB"), size(100_000_000));
+        assert_eq!(rotation("100MiB"), size(104_857_600));
+        assert_eq!(rotation("1.5GB"), size(1_500_000_000));
+        assert_eq!(rotation("100 mb"), size(100_000_000));
+        assert_eq!(rotation("512b"), size(512));
+
+        assert_eq!(rotation("30min"), secs(1800));
+        assert_eq!(rotation("1h"), secs(3600));
+        assert_eq!(rotation("90s"), secs(90));
+        assert_eq!(rotation("1min 30s"), secs(90));
+
+        assert_eq!(rotation("off"), Ok(Rotation::Off));
+        assert_eq!(rotation("OFF"), Ok(Rotation::Off));
+
+        // A bare number is a forgotten unit, not 100 bytes, so the error names both forms.
+        let err = rotation("100").unwrap_err();
+        assert!(err.contains("expected a size like"), "got: {err}");
+        let err = rotation("soon").unwrap_err();
+        assert!(err.contains("expected a size like"), "got: {err}");
+
+        // Sizes have a floor, not just a nonzero check. 100 bytes is the first accepted value.
+        assert_eq!(rotation("100b"), size(100));
+        let err = rotation("99b").unwrap_err();
+        assert!(err.contains("must be bigger than"), "got: {err}");
+        let err = rotation("0MB").unwrap_err();
+        assert!(err.contains("must be bigger than"), "got: {err}");
+        assert!(
+            rotation("0s")
+                .unwrap_err()
+                .contains("duration must not be zero")
+        );
+        assert!(
+            rotation("-3s")
+                .unwrap_err()
+                .contains("duration must not be negative")
+        );
     }
 
     #[test]
