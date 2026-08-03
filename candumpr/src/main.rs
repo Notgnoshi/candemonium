@@ -1,13 +1,13 @@
 use std::os::unix::io::AsFd;
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use candumpr::can;
+use candumpr::config::{Cli, Format, first_duplicate};
 use candumpr::debounce::Debounce;
 use candumpr::errframe::{BusState, ErrorFrame};
-use candumpr::format::{CanutilsConsoleFormatter, CanutilsFileFormatter, Formatter, TimestampMode};
+use candumpr::format::{CanutilsConsoleFormatter, CanutilsFileFormatter, Formatter};
 use candumpr::frame::CanFrame;
 use candumpr::pipeline::Pipeline;
 use candumpr::recv::netlink::{self, LinkEvent};
@@ -87,69 +87,6 @@ fn log_error_frames(batch: &[CanFrame], bus_state: &mut [BusState], names: &[Str
         }
     }
     bus_off
-}
-
-/// The first interface name that appears more than once.
-fn first_duplicate(interfaces: &[String]) -> Option<&str> {
-    let mut seen = std::collections::HashSet::new();
-    interfaces
-        .iter()
-        .find(|name| !seen.insert(name.as_str()))
-        .map(String::as_str)
-}
-
-/// Output format for received frames.
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum Format {
-    /// can-utils candump file format: `(ts) iface ID#DATA`.
-    CandumpFile,
-    /// can-utils candump console format: `(ts) iface ID [len] B0 B1 ...`.
-    CandumpConsole,
-}
-
-impl Format {
-    /// Log file extension for each output format
-    fn ext(&self, compress: bool) -> &'static str {
-        match (self, compress) {
-            (Format::CandumpFile, false) => "log",
-            (Format::CandumpFile, true) => "log.zst",
-            (Format::CandumpConsole, false) => "txt",
-            (Format::CandumpConsole, true) => "txt.zst",
-        }
-    }
-}
-
-/// Log CAN traffic from multiple networks.
-#[derive(Parser)]
-#[command(version)]
-struct Cli {
-    /// CAN interfaces to listen on.
-    #[arg(required = true)]
-    interfaces: Vec<String>,
-
-    /// Log each interface to its own file in the current directory, instead of stdout.
-    #[arg(long, short = 'l', conflicts_with = "output")]
-    log: bool,
-
-    /// Log to this file path. Truncated if it already exists.
-    #[arg(long, short = 'o', value_name = "FILE")]
-    output: Option<PathBuf>,
-
-    /// Output format for received frames.
-    #[arg(long, value_enum, default_value = "candump-file")]
-    format: Format,
-
-    /// Compress output with zstd. Requires --log or --output.
-    #[arg(long, short = 'c')]
-    compress: bool,
-
-    /// Timestamp rendering mode. Only applies to the candump formats.
-    #[arg(long, value_enum, default_value = "absolute")]
-    timestamp: TimestampMode,
-
-    /// Log level for tracing output on stderr.
-    #[arg(long, default_value = "INFO")]
-    log_level: tracing::Level,
 }
 
 fn main() -> ExitCode {

@@ -1,4 +1,5 @@
 pub mod can;
+pub mod config;
 pub mod debounce;
 pub mod errframe;
 pub mod format;
