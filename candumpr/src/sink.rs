@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::recv::Timestamp;
+use crate::template;
 use crate::writer::{FileWriter, StdoutWriter, Writer, ZstdWriter};
 
 /// Where a [Sink] writes.
@@ -16,8 +17,6 @@ pub enum Output {
         interface: String,
         /// File extension to use
         ext: String,
-        /// Index of the next file to create
-        next_index: u64,
     },
 }
 
@@ -61,9 +60,8 @@ impl SinkConfig {
                 dir,
                 interface,
                 ext,
-                next_index,
-            } => dir.join(template_filename(
-                *next_index,
+            } => dir.join(template::render(
+                template::next_index_in(dir, interface),
                 interface,
                 timestamp.sec,
                 ext,
@@ -312,24 +310,6 @@ fn classify(kind: std::io::ErrorKind, retry_activation_failures: bool) -> Activa
     }
 }
 
-/// Render seconds since the epoch as UTC at second precision, with dashes for colons
-fn iso_utc(sec: i64) -> String {
-    let ts = jiff::Timestamp::from_second(sec).unwrap_or_else(|_| {
-        let clamped = if sec < 0 {
-            jiff::Timestamp::MIN
-        } else {
-            jiff::Timestamp::MAX
-        };
-        tracing::warn!("timestamp {sec}s since the epoch is out of range; clamping to {clamped}");
-        clamped
-    });
-    ts.strftime("%Y-%m-%dT%H-%M-%SZ").to_string()
-}
-
-fn template_filename(index: u64, interface: &str, sec: i64, ext: &str) -> String {
-    format!("i{index:04}_{interface}_{}.{ext}", iso_utc(sec))
-}
-
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
@@ -339,20 +319,6 @@ mod tests {
 
     fn ts(sec: i64) -> Timestamp {
         Timestamp { sec, nsec: 0 }
-    }
-
-    #[test]
-    fn iso_utc_renders_and_clamps() {
-        let vectors = [
-            (0, "1970-01-01T00-00-00Z"),
-            (1732117385, "2024-11-20T15-43-05Z"),
-            (-86400, "1969-12-31T00-00-00Z"),
-            (i64::MIN, "-9999-01-02T01-59-59Z"),
-            (i64::MAX, "9999-12-30T22-00-00Z"),
-        ];
-        for (sec, expected) in vectors {
-            assert_eq!(iso_utc(sec), expected, "sec={sec}");
-        }
     }
 
     #[test]
@@ -367,7 +333,6 @@ mod tests {
             dir: blocker.join("logs"),
             interface: "can0".to_string(),
             ext: "log".to_string(),
-            next_index: 0,
         });
         config.flush_interval = None;
         config.sync_interval = None;
@@ -376,26 +341,12 @@ mod tests {
         assert!(sink.write(b"PAYLOAD", ts(42)).is_err());
     }
 
-    #[test]
-    fn template_filename_renders_the_fixed_scheme() {
-        assert_eq!(
-            template_filename(0, "can0", 1732117385, "log"),
-            "i0000_can0_2024-11-20T15-43-05Z.log"
-        );
-        // The index pads to width 4 and keeps counting past 9999 as plain decimal.
-        assert_eq!(
-            template_filename(10000, "vcan1", 0, "pcap"),
-            "i10000_vcan1_1970-01-01T00-00-00Z.pcap"
-        );
-    }
-
     /// A Template-output Sink logging into `dir`, with time-based flush/sync disabled.
     fn sink_in(dir: &TempDir, header: Option<Vec<u8>>) -> Sink {
         let mut config = SinkConfig::new(Output::Template {
             dir: dir.path().to_path_buf(),
             interface: "can0".to_string(),
             ext: "log".to_string(),
-            next_index: 0,
         });
         config.header = header;
         config.flush_interval = None;
@@ -431,6 +382,27 @@ mod tests {
         assert_eq!(
             paths[0].file_name().unwrap(),
             "i0000_can0_2024-11-20T15-43-05Z.log"
+        );
+    }
+
+    #[test]
+    fn activation_picks_the_next_index_after_existing_logs() {
+        let dir = TempDir::new().unwrap();
+        let mut sink = sink_in(&dir, None);
+        std::fs::write(dir.path().join("i0007_can0_<some timestamp>.log"), b"OLD").unwrap();
+
+        sink.write(b"NEW", ts(1732117385)).unwrap();
+
+        let names: Vec<_> = entries(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "i0007_can0_<some timestamp>.log",
+                "i0008_can0_2024-11-20T15-43-05Z.log"
+            ]
         );
     }
 
