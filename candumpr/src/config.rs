@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
+use eyre::WrapErr;
 
 use crate::format::TimestampMode;
 use crate::sink::{DEFAULT_FLUSH_INTERVAL, DEFAULT_SYNC_INTERVAL, Output};
@@ -43,27 +44,41 @@ impl Format {
 #[command(version)]
 pub struct Cli {
     /// CAN interfaces to listen on.
-    #[arg(required = true)]
+    #[arg(required_unless_present = "daemon", conflicts_with = "daemon")]
     pub interfaces: Vec<String>,
 
+    /// Run in daemon mode, using the given config file. Incompatible with all other CLI arguments.
+    #[arg(long, value_name = "FILE")]
+    pub daemon: Option<PathBuf>,
+
     /// Log each interface to its own file in the current directory, instead of stdout.
-    #[arg(long, short = 'l', conflicts_with = "output")]
+    #[arg(long, short = 'l', conflicts_with_all = ["output", "daemon"])]
     pub log: bool,
 
     /// Log to this file path. Truncated if it already exists.
-    #[arg(long, short = 'o', value_name = "FILE")]
+    #[arg(long, short = 'o', value_name = "FILE", conflicts_with = "daemon")]
     pub output: Option<PathBuf>,
 
     /// Output format for received frames.
-    #[arg(long, value_enum, default_value = "candump-file")]
+    #[arg(
+        long,
+        value_enum,
+        default_value = "candump-file",
+        conflicts_with = "daemon"
+    )]
     pub format: Format,
 
     /// Compress output with zstd. Requires --log or --output.
-    #[arg(long, short = 'c')]
+    #[arg(long, short = 'c', conflicts_with = "daemon")]
     pub compress: bool,
 
     /// Timestamp rendering mode. Only applies to the candump formats.
-    #[arg(long, value_enum, default_value = "absolute")]
+    #[arg(
+        long,
+        value_enum,
+        default_value = "absolute",
+        conflicts_with = "daemon"
+    )]
     pub timestamp: TimestampMode,
 
     /// Log level for tracing output on stderr.
@@ -185,10 +200,79 @@ fn parse_raw(src: &str) -> eyre::Result<(Raw, Vec<String>)> {
 }
 
 impl Config {
+    /// Resolve the process configuration from parsed CLI arguments
+    pub fn resolve(cli: Cli) -> eyre::Result<Config> {
+        match &cli.daemon {
+            Some(path) => Config::from_toml_file(path),
+            None => Config::from_cli(&cli),
+        }
+    }
+
+    fn from_cli(cli: &Cli) -> eyre::Result<Config> {
+        // A repeated interface would log every frame on it twice, and in --log mode its two Sinks
+        // would race to create and truncate the same scheme-named file.
+        if let Some(duplicate) = first_duplicate(&cli.interfaces) {
+            eyre::bail!("interface {duplicate} given more than once");
+        }
+
+        // Compressing stdout would hand a terminal a binary stream, and the pipe case is served just
+        // as well by `candumpr can0 | zstd`.
+        if cli.compress && !cli.log && cli.output.is_none() {
+            eyre::bail!("--compress requires --log or --output");
+        }
+        if let Some(path) = &cli.output
+            && cli.compress
+            && path.extension().is_none_or(|ext| ext != "zst")
+        {
+            // File extensions are useful, but not required. Give a QoL warning.
+            tracing::warn!(
+                path = %path.display(),
+                "output is zstd-compressed but the path does not end in .zst"
+            );
+        }
+
+        // --log gives every interface its own output, so its traffic lands in its own file.
+        // Everything else interleaves all interfaces into one output.
+        let outputs: Vec<Output> = if cli.log {
+            cli.interfaces
+                .iter()
+                .map(|interface| Output::Template {
+                    dir: ".".into(),
+                    interface: interface.clone(),
+                    ext: cli.format.ext(cli.compress).to_string(),
+                })
+                .collect()
+        } else if let Some(path) = &cli.output {
+            vec![Output::Path(path.clone())]
+        } else {
+            vec![Output::Stdout]
+        };
+
+        let streams = outputs
+            .into_iter()
+            .map(|output| StreamConfig {
+                output,
+                format: cli.format,
+                timestamp: cli.timestamp,
+                compress: cli.compress,
+                flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
+                sync_interval: Some(DEFAULT_SYNC_INTERVAL),
+            })
+            .collect();
+
+        Ok(Config {
+            interfaces: cli.interfaces.clone(),
+            streams,
+            retry_activation_failures: false,
+        })
+    }
+
     /// Parse a [Config] from the given file path
     pub fn from_toml_file(path: impl AsRef<std::path::Path>) -> eyre::Result<Config> {
-        let src = std::fs::read_to_string(path)?;
-        Config::from_toml(&src)
+        let path = path.as_ref();
+        let src = std::fs::read_to_string(path)
+            .wrap_err_with(|| format!("failed to read config file {}", path.display()))?;
+        Config::from_toml(&src).wrap_err_with(|| format!("invalid config file {}", path.display()))
     }
 
     /// Parse a [Config] from the given TOML text

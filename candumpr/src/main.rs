@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use candumpr::can;
-use candumpr::config::{Cli, Format, first_duplicate};
+use candumpr::config::{Cli, Config, Format};
 use candumpr::debounce::Debounce;
 use candumpr::errframe::{BusState, ErrorFrame};
 use candumpr::format::{CanutilsConsoleFormatter, CanutilsFileFormatter, Formatter};
@@ -12,7 +12,7 @@ use candumpr::frame::CanFrame;
 use candumpr::pipeline::Pipeline;
 use candumpr::recv::netlink::{self, LinkEvent};
 use candumpr::recv::receiver::{BATCH_CAPACITY, Receiver};
-use candumpr::sink::{Output, Sink, SinkConfig};
+use candumpr::sink::{Sink, SinkConfig};
 use clap::Parser;
 use crossbeam_channel::select;
 use tracing_subscriber::filter::Targets;
@@ -106,40 +106,24 @@ fn main() -> ExitCode {
         .with(filter)
         .init();
 
-    // A repeated interface would log every frame on it twice, and in --log mode its two Sinks would
-    // race to create and truncate the same scheme-named file.
-    if let Some(duplicate) = first_duplicate(&cli.interfaces) {
-        tracing::error!(interface = %duplicate, "interface given more than once");
-        return ExitCode::FAILURE;
-    }
-
-    // Compressing stdout would hand a terminal a binary stream, and the pipe case is served just as
-    // well by `candumpr can0 | zstd`.
-    if cli.compress && !cli.log && cli.output.is_none() {
-        tracing::error!("--compress requires --log or --output");
-        return ExitCode::FAILURE;
-    }
-    if let Some(path) = &cli.output
-        && cli.compress
-        && path.extension().is_none_or(|ext| ext != "zst")
-    {
-        // File extensions are useful, but not required. Give a QoL warning.
-        tracing::warn!(
-            path = %path.display(),
-            "output is zstd-compressed but the path does not end in .zst"
-        );
-    }
+    let config = match Config::resolve(cli) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!(error = ?e, "invalid configuration");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // The sockets vector defines the canonical interface ordering. The orderings of:
     //
-    // 1. cli.interfaces
+    // 1. config.interfaces
     // 2. sockets
     // 3. Pipeline::sinks / bufs
     // 4. et al.
     //
     // all follow the same ordering, and are all indexed by CanFrame::sock_id
-    let sockets: Vec<_> = match cli
-        .interfaces
+    let names = config.interfaces.clone();
+    let sockets: Vec<_> = match names
         .iter()
         .map(|name| can::open_can_raw(name))
         .collect::<std::io::Result<_>>()
@@ -151,7 +135,7 @@ fn main() -> ExitCode {
         }
     };
 
-    for (name, sock) in cli.interfaces.iter().zip(&sockets) {
+    for (name, sock) in names.iter().zip(&sockets) {
         match can::get_recv_buffer(sock.as_fd()) {
             Ok(bytes) => {
                 tracing::info!(interface = %name, rcvbuf_bytes = bytes, "opened CAN socket")
@@ -184,51 +168,35 @@ fn main() -> ExitCode {
     });
 
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<LinkEvent>();
-    let nl_names = cli.interfaces.clone();
+    let nl_names = names.clone();
     let nl_handle = std::thread::spawn(move || netlink::run(&STOP, &nl_names, &event_tx));
 
-    // Names indexed by sock_id, kept for logging link and bus transitions on the main thread.
-    let names = cli.interfaces.clone();
     // Last observed link state per sock_id, so we log only edges.
     let mut link_up: Vec<Option<bool>> = vec![None; names.len()];
     // Last logged bus state per sock_id, so we log only transitions.
     let mut bus_state: Vec<BusState> = vec![BusState::default(); names.len()];
 
-    let make_formatter = || -> Box<dyn Formatter> {
-        match cli.format {
-            Format::CandumpFile => {
-                Box::new(CanutilsFileFormatter::new(names.clone(), cli.timestamp))
-            }
-            Format::CandumpConsole => {
-                Box::new(CanutilsConsoleFormatter::new(names.clone(), cli.timestamp))
-            }
-        }
-    };
-
-    // --log gives every interface its own output, so its traffic lands in its own file. Everything
-    // else interleaves all interfaces into one output.
-    let outputs: Vec<Output> = if cli.log {
-        names
-            .iter()
-            .map(|interface| Output::Template {
-                dir: ".".into(),
-                interface: interface.clone(),
-                ext: cli.format.ext(cli.compress).to_string(),
-            })
-            .collect()
-    } else if let Some(path) = cli.output {
-        vec![Output::Path(path)]
-    } else {
-        vec![Output::Stdout]
-    };
-    let streams = outputs
+    let retry_activation_failures = config.retry_activation_failures;
+    let streams = config
+        .streams
         .into_iter()
-        .map(|output| {
-            let formatter = make_formatter();
-            let mut config = SinkConfig::new(output);
-            config.header = formatter.header().map(|h| h.to_vec());
-            config.compress = cli.compress;
-            (formatter, Sink::new(config))
+        .map(|stream| {
+            let formatter: Box<dyn Formatter> = match stream.format {
+                Format::CandumpFile => {
+                    Box::new(CanutilsFileFormatter::new(names.clone(), stream.timestamp))
+                }
+                Format::CandumpConsole => Box::new(CanutilsConsoleFormatter::new(
+                    names.clone(),
+                    stream.timestamp,
+                )),
+            };
+            let mut sink = SinkConfig::new(stream.output);
+            sink.header = formatter.header().map(|h| h.to_vec());
+            sink.compress = stream.compress;
+            sink.flush_interval = stream.flush_interval;
+            sink.sync_interval = stream.sync_interval;
+            sink.retry_activation_failures = retry_activation_failures;
+            (formatter, Sink::new(sink))
         })
         .collect();
     let mut pipeline = Pipeline::new(streams);
