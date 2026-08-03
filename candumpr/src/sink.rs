@@ -282,6 +282,25 @@ impl Sink {
         Ok(())
     }
 
+    fn rotatable(&self) -> bool {
+        // Only templated filenames that have the i<index> prefix can be rotated.
+        matches!(self.config.output, Output::Template { .. })
+    }
+
+    /// Finalize the current file and return to Pending, so the next write opens a new one.
+    pub fn rotate(&mut self) -> eyre::Result<()> {
+        if !self.rotatable() {
+            return Ok(());
+        }
+        let SinkState::Active { writer, .. } = &mut self.state else {
+            return Ok(());
+        };
+        let result = writer.finish();
+        // We can only .finish() once, so if it fails, we still have to transition into Pending.
+        self.state = SinkState::Pending { last_attempt: None };
+        Ok(result?)
+    }
+
     /// Finalize the writer and transition to Closed.
     pub fn close(&mut self) -> eyre::Result<()> {
         let result = match &mut self.state {
@@ -472,6 +491,59 @@ mod tests {
         // finish() flushed and synced: contents are complete without an explicit flush.
         assert_eq!(contents(&dir), b"PAYLOAD");
         assert!(sink.write(b"MORE", ts(43)).is_err());
+    }
+
+    #[test]
+    fn rotation_finalizes_the_file_and_the_next_write_opens_the_next_index() {
+        let dir = TempDir::new().unwrap();
+        let mut sink = sink_in(&dir, Some(b"HDR".to_vec()));
+        sink.write(b"FIRST", ts(1732117385)).unwrap();
+
+        sink.rotate().unwrap();
+        assert!(matches!(sink.state, SinkState::Pending { .. }));
+        // rotate() finishes the writer, so the first file is complete without an explicit flush.
+        assert_eq!(contents(&dir), b"HDRFIRST");
+
+        sink.write(b"SECOND", ts(1732117385)).unwrap();
+        sink.flush().unwrap();
+
+        let paths = entries(&dir);
+        let names: Vec<_> = paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "i0000_can0_2024-11-20T15-43-05Z.log",
+                "i0001_can0_2024-11-20T15-43-05Z.log"
+            ]
+        );
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"HDRFIRST");
+        // The header is rewritten at the top of the rotated file.
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), b"HDRSECOND");
+    }
+
+    #[test]
+    fn rotation_is_a_noop_for_path_output() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("can.log");
+        let mut config = SinkConfig::new(Output::Path(path.clone()));
+        config.flush_interval = None;
+        config.sync_interval = None;
+        let mut sink = Sink::new(config);
+
+        sink.write(b"FIRST", ts(42)).unwrap();
+        sink.rotate().unwrap();
+        assert!(
+            matches!(sink.state, SinkState::Active { .. }),
+            "a non-rotatable sink stays Active"
+        );
+        sink.write(b"SECOND", ts(42)).unwrap();
+        sink.flush().unwrap();
+
+        assert_eq!(entries(&dir), vec![path.clone()]);
+        assert_eq!(std::fs::read(&path).unwrap(), b"FIRSTSECOND");
     }
 
     #[test]
