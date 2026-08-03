@@ -17,8 +17,6 @@ pub enum Output {
         interface: String,
         /// File extension to use
         ext: String,
-        /// Index of the next file to create
-        next_index: u64,
     },
 }
 
@@ -62,8 +60,12 @@ impl SinkConfig {
                 dir,
                 interface,
                 ext,
-                next_index,
-            } => dir.join(template::render(*next_index, interface, timestamp.sec, ext)),
+            } => dir.join(template::render(
+                template::next_index_in(dir, interface),
+                interface,
+                timestamp.sec,
+                ext,
+            )),
         };
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -331,7 +333,6 @@ mod tests {
             dir: blocker.join("logs"),
             interface: "can0".to_string(),
             ext: "log".to_string(),
-            next_index: 0,
         });
         config.flush_interval = None;
         config.sync_interval = None;
@@ -346,7 +347,6 @@ mod tests {
             dir: dir.path().to_path_buf(),
             interface: "can0".to_string(),
             ext: "log".to_string(),
-            next_index: 0,
         });
         config.header = header;
         config.flush_interval = None;
@@ -382,6 +382,27 @@ mod tests {
         assert_eq!(
             paths[0].file_name().unwrap(),
             "i0000_can0_2024-11-20T15-43-05Z.log"
+        );
+    }
+
+    #[test]
+    fn activation_picks_the_next_index_after_existing_logs() {
+        let dir = TempDir::new().unwrap();
+        let mut sink = sink_in(&dir, None);
+        std::fs::write(dir.path().join("i0007_can0_<some timestamp>.log"), b"OLD").unwrap();
+
+        sink.write(b"NEW", ts(1732117385)).unwrap();
+
+        let names: Vec<_> = entries(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "i0007_can0_<some timestamp>.log",
+                "i0008_can0_2024-11-20T15-43-05Z.log"
+            ]
         );
     }
 

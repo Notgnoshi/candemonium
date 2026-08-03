@@ -277,7 +277,6 @@ fn main() -> ExitCode {
                 dir: ".".into(),
                 interface: interface.clone(),
                 ext: cli.format.ext(cli.compress).to_string(),
-                next_index: 0,
             })
             .collect()
     } else if let Some(path) = cli.output {
