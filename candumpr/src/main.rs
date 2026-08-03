@@ -195,6 +195,7 @@ fn main() -> ExitCode {
             sink.compress = stream.compress;
             sink.flush_interval = stream.flush_interval;
             sink.sync_interval = stream.sync_interval;
+            sink.rotation = stream.rotation;
             sink.retry_activation_failures = retry_activation_failures;
             (formatter, Sink::new(sink))
         })

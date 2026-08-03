@@ -37,6 +37,8 @@ pub struct SinkConfig {
     pub retry_activation_failures: bool,
     /// Compress file output with zstd. Ignored for [Output::Stdout].
     pub compress: bool,
+    /// When to finalize the current file and start a new one.
+    pub rotation: Rotation,
 }
 
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
@@ -52,6 +54,7 @@ impl SinkConfig {
             sync_interval: Some(DEFAULT_SYNC_INTERVAL),
             retry_activation_failures: false,
             compress: false,
+            rotation: Rotation::Off,
         }
     }
 
@@ -112,6 +115,7 @@ pub(crate) enum SinkState {
         bytes_since_flush: usize,
         last_flush: Instant,
         last_sync: Instant,
+        opened_at: Instant,
     },
     Closed,
 }
@@ -185,6 +189,7 @@ impl Sink {
                 bytes_since_flush: 0,
                 last_flush: now,
                 last_sync: now,
+                opened_at: now,
             };
         }
 
@@ -206,24 +211,52 @@ impl Sink {
             *last_flush = Instant::now();
         }
 
+        if self.should_rotate(Instant::now()) {
+            self.rotate()?;
+        }
+
         Ok(())
+    }
+
+    /// Whether the active file has hit its rotation limit.
+    fn should_rotate(&self, now: Instant) -> bool {
+        if !self.rotatable() {
+            return false;
+        }
+        let SinkState::Active {
+            writer, opened_at, ..
+        } = &self.state
+        else {
+            return false;
+        };
+        match self.config.rotation {
+            Rotation::Off => false,
+            Rotation::Size(limit) => writer.bytes_written() >= limit,
+            Rotation::Interval(limit) => now.duration_since(*opened_at) >= limit,
+        }
     }
 
     /// Check the time-based flush and sync triggers
     ///
     /// Should be called periodically
     pub fn tick(&mut self) -> eyre::Result<()> {
+        let now = Instant::now();
+
+        if self.should_rotate(now) {
+            // Rotation already flushes and syncs, and leaves the sink in SinkState::Pending
+            return self.rotate();
+        }
+
         let SinkState::Active {
             writer,
             bytes_since_flush,
             last_flush,
             last_sync,
+            ..
         } = &mut self.state
         else {
             return Ok(());
         };
-
-        let now = Instant::now();
 
         if let Some(d) = self.config.sync_interval
             && now.duration_since(*last_sync) >= d
@@ -270,6 +303,7 @@ impl Sink {
             bytes_since_flush,
             last_flush,
             last_sync,
+            ..
         } = &mut self.state
         else {
             return Ok(());
@@ -522,6 +556,61 @@ mod tests {
         assert_eq!(std::fs::read(&paths[0]).unwrap(), b"HDRFIRST");
         // The header is rewritten at the top of the rotated file.
         assert_eq!(std::fs::read(&paths[1]).unwrap(), b"HDRSECOND");
+    }
+
+    fn rotating_sink_in(dir: &TempDir, rotation: Rotation) -> Sink {
+        let mut config = SinkConfig::new(Output::Template {
+            dir: dir.path().to_path_buf(),
+            interface: "can0".to_string(),
+            ext: "log".to_string(),
+        });
+        config.flush_interval = None;
+        config.sync_interval = None;
+        config.flush_threshold_bytes = 1;
+        config.rotation = rotation;
+        Sink::new(config)
+    }
+
+    #[test]
+    fn size_rotation_starts_a_new_file_once_the_limit_is_crossed() {
+        let dir = TempDir::new().unwrap();
+        let mut sink = rotating_sink_in(&dir, Rotation::Size(100));
+        let half = [b'A'; 50];
+
+        sink.write(&half, ts(1732117385)).unwrap();
+        assert!(
+            matches!(sink.state, SinkState::Active { .. }),
+            "50 of 100 bytes is under the limit"
+        );
+
+        sink.write(&half, ts(1732117385)).unwrap();
+        assert!(
+            matches!(sink.state, SinkState::Pending { .. }),
+            "writing the next 50 bytes should have rotated and finished the first file"
+        );
+
+        sink.write(b"NEXT", ts(1732117385)).unwrap();
+        let paths = entries(&dir);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), [half, half].concat());
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), b"NEXT");
+    }
+
+    #[test]
+    fn duration_rotation_fires_from_tick() {
+        let dir = TempDir::new().unwrap();
+        let mut sink = rotating_sink_in(&dir, Rotation::Interval(Duration::from_millis(1)));
+
+        sink.write(b"PAYLOAD", ts(1732117385)).unwrap();
+        assert!(matches!(sink.state, SinkState::Active { .. }));
+
+        // TODO: Pass Instant::now() into tick()
+        std::thread::sleep(Duration::from_millis(5));
+        sink.tick().unwrap();
+
+        assert!(matches!(sink.state, SinkState::Pending { .. }));
+        // contents() asserts a single file is present in the directory
+        assert_eq!(contents(&dir), b"PAYLOAD");
     }
 
     #[test]
