@@ -7,6 +7,7 @@ use crate::template;
 use crate::writer::{FileWriter, StdoutWriter, Writer, ZstdWriter};
 
 /// Where a [Sink] writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Output {
     Stdout,
     /// An exact user-given path, truncated if it already exists.
@@ -37,14 +38,17 @@ pub struct SinkConfig {
     pub compress: bool,
 }
 
+pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 impl SinkConfig {
     pub fn new(output: Output) -> SinkConfig {
         SinkConfig {
             output,
             header: None,
             flush_threshold_bytes: 64 * 1024,
-            flush_interval: Some(Duration::from_secs(5)),
-            sync_interval: Some(Duration::from_secs(5 * 60)),
+            flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
+            sync_interval: Some(DEFAULT_SYNC_INTERVAL),
             retry_activation_failures: false,
             compress: false,
         }

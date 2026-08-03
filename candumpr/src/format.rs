@@ -8,7 +8,8 @@ use crate::recv::Timestamp;
 /// How candumpr renders the timestamp prefix on candump-format output.
 ///
 /// Only the candump formats consult this. ASC and PCAP carry their own intrinsic timestamps.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum TimestampMode {
     /// The frame's absolute receive time
     #[default]
