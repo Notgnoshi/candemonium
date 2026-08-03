@@ -25,6 +25,13 @@ pub trait Writer: std::io::Write {
     ///
     /// Writes any epilogues, flush, and sync. Writes may not be performed after a finish.
     fn finish(&mut self) -> std::io::Result<()>;
+
+    /// Bytes this writer has written
+    ///
+    /// This counts the number of bytes that were written to disk, not the number of bytes that were
+    /// passed into the writer to write. [ZstdWriter] is an example of a writer where bytes in !=
+    /// bytes out.
+    fn bytes_written(&self) -> u64;
 }
 
 impl<W: Writer + 'static> Writer for std::io::BufWriter<W> {
@@ -36,5 +43,9 @@ impl<W: Writer + 'static> Writer for std::io::BufWriter<W> {
     fn finish(&mut self) -> std::io::Result<()> {
         self.flush()?;
         self.get_mut().finish()
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.get_ref().bytes_written()
     }
 }

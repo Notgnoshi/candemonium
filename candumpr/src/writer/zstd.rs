@@ -87,6 +87,10 @@ impl<W: Writer> Writer for ZstdWriter<W> {
         self.flush()?;
         self.inner.finish()
     }
+
+    fn bytes_written(&self) -> u64 {
+        self.inner.bytes_written()
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +146,10 @@ mod tests {
 
         fn finish(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+
+        fn bytes_written(&self) -> u64 {
+            self.bytes.len() as u64
         }
     }
 

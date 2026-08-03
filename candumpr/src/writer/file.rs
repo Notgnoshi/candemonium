@@ -7,6 +7,7 @@ use super::Writer;
 /// Use [std::io::BufWriter] for buffering, if desired.
 pub struct FileWriter {
     file: std::fs::File,
+    written: u64,
 }
 
 impl FileWriter {
@@ -14,13 +15,15 @@ impl FileWriter {
     ///
     /// This lets the caller decide the open options.
     pub fn new(file: std::fs::File) -> Self {
-        Self { file }
+        Self { file, written: 0 }
     }
 }
 
 impl std::io::Write for FileWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.file.write(buf)
+        let n = self.file.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -36,5 +39,9 @@ impl Writer for FileWriter {
     fn finish(&mut self) -> std::io::Result<()> {
         self.flush()?;
         self.sync()
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.written
     }
 }
