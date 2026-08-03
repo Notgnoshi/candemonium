@@ -129,9 +129,7 @@ fn an_invalid_config_exits_nonzero() {
         r#"
         [defaults]
         compress = false
-
-        [defaults.rotation]
-        limit = "100MB"
+        UNKNOWN = "KEY"  # triggers a warning; still parses
 
         [interface.can0]
         "#,
@@ -151,7 +149,7 @@ fn an_invalid_config_exits_nonzero() {
     // Use separate .contains() calls to skip over the tracing fmt ANSI sequences
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unknown configuration key") && stderr.contains("defaults.rotation"),
+        stderr.contains("unknown configuration key") && stderr.contains("defaults.UNKNOWN"),
         "expected the unimplemented key to be warned about, got:\n{stderr}"
     );
     assert!(

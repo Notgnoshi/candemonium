@@ -47,9 +47,13 @@ Each of the `[defaults]` and `[interface.<name>]` tables support the following k
 | `timestamp`      | `"absolute"`     | Timestamp mode: `"absolute"`, `"delta"`, or `"zero"`                       |
 | `flush_interval` | `"5s"`           | Upper bound between flushes. `"off"` disables periodic flushing            |
 | `sync_interval`  | `"5min"`         | Upper bound between fsyncs. `"off"` disables periodic syncing              |
+| `rotation`       | `"30min"`        | Rotate the log once it exceeds a size or an age. `"off"` disables rotation |
 
 The interval strings are parsed using
 [jiff::SignedDuration](https://docs.rs/jiff/latest/jiff/struct.SignedDuration.html).
+
+The `rotation` parameter can accept time intervals or size intervals. Examples: `512B`, `100 MiB`,
+`1 gb`, `1m` (1 minute), `30 minutes`, `off`.
 
 ## Output files
 

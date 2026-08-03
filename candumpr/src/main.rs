@@ -19,10 +19,15 @@ use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-static STOP: AtomicBool = AtomicBool::new(false);
+static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
+static SIGNAL_ROTATE: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn signal_handler(_sig: libc::c_int) {
-    STOP.store(true, Ordering::Relaxed);
+extern "C" fn signal_handler(sig: libc::c_int) {
+    if sig == libc::SIGHUP {
+        SIGNAL_ROTATE.store(true, Ordering::Relaxed);
+    } else {
+        SIGNAL_STOP.store(true, Ordering::Relaxed);
+    }
 }
 
 /// True if any error in the chain is an EPIPE.
@@ -155,7 +160,7 @@ fn main() -> ExitCode {
             .expect("recycle channel must accept initial pool");
     }
 
-    for sig in [libc::SIGINT, libc::SIGTERM] {
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         unsafe {
             libc::signal(sig, signal_handler as *const () as libc::sighandler_t);
         }
@@ -163,13 +168,13 @@ fn main() -> ExitCode {
 
     let recv_handle = std::thread::spawn(move || -> eyre::Result<u64> {
         let mut recv = Receiver::new(sockets)?;
-        let total = recv.run(&STOP, &full_tx, &empty_rx)?;
+        let total = recv.run(&SIGNAL_STOP, &full_tx, &empty_rx)?;
         Ok(total)
     });
 
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<LinkEvent>();
     let nl_names = names.clone();
-    let nl_handle = std::thread::spawn(move || netlink::run(&STOP, &nl_names, &event_tx));
+    let nl_handle = std::thread::spawn(move || netlink::run(&SIGNAL_STOP, &nl_names, &event_tx));
 
     // Last observed link state per sock_id, so we log only edges.
     let mut link_up: Vec<Option<bool>> = vec![None; names.len()];
@@ -195,6 +200,7 @@ fn main() -> ExitCode {
             sink.compress = stream.compress;
             sink.flush_interval = stream.flush_interval;
             sink.sync_interval = stream.sync_interval;
+            sink.rotation = stream.rotation;
             sink.retry_activation_failures = retry_activation_failures;
             (formatter, Sink::new(sink))
         })
@@ -250,17 +256,24 @@ fn main() -> ExitCode {
                 failed = true;
             }
         }
+        if SIGNAL_ROTATE.swap(false, Ordering::Relaxed)
+            && let Err(e) = pipeline.rotate()
+        {
+            tracing::error!(error = ?e, "failed to rotate on SIGHUP");
+            failed = true;
+            break;
+        }
         if let Err(e) = pipeline.tick() {
             tracing::error!(error = ?e, "periodic flush or sync failed");
             failed = true;
         }
-        if STOP.load(Ordering::Relaxed) {
+        if SIGNAL_STOP.load(Ordering::Relaxed) {
             break;
         }
     }
 
     // Set STOP so the receiver exits even if we broke out on a channel disconnect.
-    STOP.store(true, Ordering::Relaxed);
+    SIGNAL_STOP.store(true, Ordering::Relaxed);
 
     // Join before draining so we write every received frame.
     match recv_handle.join() {

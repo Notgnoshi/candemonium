@@ -88,6 +88,11 @@ impl Pipeline {
         self.for_each_sink(Sink::sync)
     }
 
+    /// Rotate every sink, so the next write to each opens a new file.
+    pub fn rotate(&mut self) -> eyre::Result<()> {
+        self.for_each_sink(Sink::rotate)
+    }
+
     /// Close every sink, finalizing each writer.
     pub fn close(&mut self) -> eyre::Result<()> {
         self.for_each_sink(Sink::close)

@@ -15,6 +15,7 @@ description = "Opinionated CAN utilities written in Rust"
 
 [workspace.dependencies]
 assert_cmd = { version = "2.2.0", features = ["color-auto"] }
+bytesize = "2.7"
 clap = { version = "4", features = ["derive"] }
 color-eyre = "0.6"
 crossbeam-channel = "0.5"
