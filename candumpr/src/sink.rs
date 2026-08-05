@@ -2,8 +2,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::config::Interval;
+use crate::config::{Interval, RetentionLimit};
 use crate::recv::Timestamp;
+use crate::retention::RetentionPolicy;
 use crate::template;
 use crate::writer::{FileWriter, StdoutWriter, Writer, ZstdWriter};
 
@@ -40,6 +41,8 @@ pub struct SinkConfig {
     pub compress: bool,
     /// When to finalize the current file and start a new one.
     pub rotation: Interval,
+    /// When to delete old files from the output directory. Only applies to [Output::Template].
+    pub retention: RetentionLimit,
 }
 
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
@@ -55,6 +58,7 @@ impl SinkConfig {
             retry_activation_failures: false,
             compress: false,
             rotation: Interval::Off,
+            retention: RetentionLimit::Off,
         }
     }
 
@@ -94,6 +98,7 @@ impl SinkConfig {
 pub struct Sink {
     config: SinkConfig,
     pub(crate) state: SinkState,
+    retention: Option<RetentionPolicy>,
 }
 
 /// Minimum time between activation attempts after a failed activation.
@@ -121,9 +126,20 @@ pub(crate) enum SinkState {
 impl Sink {
     /// Construct a Sink in the Pending state. Does no I/O.
     pub fn new(config: SinkConfig) -> Self {
+        let retention = match &config.output {
+            // In daemon mode, candumpr creates the <output dir>/<interface dir>/ directory, which
+            // gives candumpr exclusive ownership of its contents. That makes it safe for the
+            // RetentionPolicy to delete files in it. In CLI mode however, candumpr writes files to
+            // the CWD, which we DO NOT want to delete files from.
+            Output::Template { dir, .. } => {
+                Some(RetentionPolicy::new(config.retention, dir.clone()))
+            }
+            Output::Stdout | Output::Path(_) => None,
+        };
         Self {
             config,
             state: SinkState::Pending { last_attempt: None },
+            retention,
         }
     }
 
@@ -147,6 +163,7 @@ impl Sink {
         }
 
         let mut wrote = 0;
+        let mut just_activated = false;
 
         if let SinkState::Pending { last_attempt } = &self.state {
             if let Some(prev) = last_attempt
@@ -190,6 +207,7 @@ impl Sink {
                 last_sync: now,
                 opened_at: now,
             };
+            just_activated = true;
         }
 
         let SinkState::Active {
@@ -203,6 +221,12 @@ impl Sink {
         else {
             unreachable!("state must be Active after the Pending branch above");
         };
+        if just_activated
+            && let Some(policy) = &mut self.retention
+            && let Some(path) = writer.path()
+        {
+            policy.activated(path)?;
+        }
         writer.write_all(bytes)?;
         wrote += bytes.len();
         *bytes_since_flush += wrote;
@@ -222,6 +246,10 @@ impl Sink {
             writer.flush()?;
             *bytes_since_flush = 0;
             *last_flush = Instant::now();
+        }
+
+        if let Some(policy) = &mut self.retention {
+            policy.wrote(writer.bytes_written())?;
         }
 
         if self.should_rotate(Instant::now()) {

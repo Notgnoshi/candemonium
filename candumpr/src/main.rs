@@ -201,6 +201,7 @@ fn main() -> ExitCode {
             sink.flush_every = stream.flush_every;
             sink.sync_every = stream.sync_every;
             sink.rotation = stream.rotation;
+            sink.retention = stream.retention;
             sink.retry_activation_failures = retry_activation_failures;
             (formatter, Sink::new(sink))
         })
