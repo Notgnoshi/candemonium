@@ -7,6 +7,7 @@ pub mod frame;
 pub mod pipeline;
 pub mod quantity;
 pub mod recv;
+pub mod retention;
 pub mod sink;
 pub mod template;
 pub mod writer;
