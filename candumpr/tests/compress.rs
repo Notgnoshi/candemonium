@@ -32,9 +32,12 @@ fn zstd_d(path: &Path) -> (ExitStatus, Vec<u8>) {
 }
 
 /// The single log file candumpr is writing in `dir`, once it has created one.
+///
+/// `dir` itself may not exist yet: daemon mode creates the per-interface subdirectory together
+/// with the first log file.
 fn log_file(dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(dir)
-        .unwrap()
+        .ok()?
         .next()
         .map(|entry| entry.unwrap().path())
 }
@@ -98,12 +101,28 @@ fn logs_compressed_to_a_zst_file() {
 fn sigkill_leaves_a_decodable_prefix() {
     let vcans = VcanHarness::new(1).unwrap();
     let iface = &vcans.names()[0];
-    let dir = tempfile::TempDir::new().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cfg = tmp.path().join("config").join("candumpr.toml");
+    std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+    // Use daemon mode so we can specify the flush interval in bytes rather than time, so that the
+    // test runs faster.
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"
+            [defaults]
+            directory = "{}"
+            flush_every = "100 B"
+
+            [interface.{iface}]
+            "#,
+            tmp.path().join("log").display()
+        ),
+    )
+    .unwrap();
 
     let child = tool!("candumpr")
-        .args(["-l", "--compress"])
-        .arg(iface)
-        .current_dir(dir.path())
+        .arg(format!("--daemon={}", cfg.display()))
         .spawn_piped()
         .unwrap();
 
@@ -114,12 +133,13 @@ fn sigkill_leaves_a_decodable_prefix() {
     // lands in the middle of a zstd block rather than after one.
     let tx = can::open_can_raw_blocking(iface).unwrap();
     let mut sent = 0u32;
+    let log_subdir = tmp.path().join("log").join(iface.as_str());
     let path = loop {
         for _ in 0..50 {
             can::send_frame(tx.as_fd(), &LinuxCanFrame::new(0x123, &sent.to_be_bytes())).unwrap();
             sent += 1;
         }
-        if let Some(path) = log_file(dir.path())
+        if let Some(path) = log_file(&log_subdir)
             && path.metadata().unwrap().len() > 0
         {
             break path;

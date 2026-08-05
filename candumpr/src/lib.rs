@@ -5,7 +5,9 @@ pub mod errframe;
 pub mod format;
 pub mod frame;
 pub mod pipeline;
+pub mod quantity;
 pub mod recv;
+pub mod retention;
 pub mod sink;
 pub mod template;
 pub mod writer;
@@ -13,6 +15,9 @@ pub mod writer;
 #[cfg(test)]
 #[ctor::ctor]
 fn test_setup() {
-    tracing_subscriber::fmt().with_test_writer().init();
+    tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_ansi(true)
+        .init();
     vcan_fixture::enter_namespace();
 }

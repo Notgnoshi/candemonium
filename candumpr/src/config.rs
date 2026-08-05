@@ -6,6 +6,7 @@ use clap::Parser;
 use eyre::WrapErr;
 
 use crate::format::TimestampMode;
+use crate::quantity::Quantity;
 use crate::sink::{DEFAULT_FLUSH_INTERVAL, DEFAULT_SYNC_INTERVAL, Output};
 
 /// The first interface name that appears more than once.
@@ -83,7 +84,7 @@ pub struct Cli {
 
     /// Rotate the log when it exceeds a size ("100MB") or an age ("30min"). "off" disables.
     #[arg(long, value_name = "LIMIT", requires = "log", default_value = "30 minutes", conflicts_with_all = ["output", "daemon"])]
-    pub rotation: Rotation,
+    pub rotate_every: Interval,
 
     /// Log level for tracing output on stderr.
     #[arg(long, default_value = "INFO")]
@@ -111,83 +112,89 @@ pub struct StreamConfig {
     pub format: Format,
     pub timestamp: TimestampMode,
     pub compress: bool,
-    pub flush_interval: Option<Duration>,
-    pub sync_interval: Option<Duration>,
-    pub rotation: Rotation,
+    pub flush_every: Interval,
+    pub sync_every: Interval,
+    pub rotation: Interval,
+    pub retention: RetentionLimit,
 }
 
-/// A log rotation trigger.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Rotation {
-    #[default]
+/// How often a periodic event occurs
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Interval {
     Off,
-    /// Number of bytes written to disk
+    /// Fire once this much time has passed since the last event.
+    Every(Duration),
+    /// Fire once this many bytes have been written since the last event.
     Size(u64),
-    /// Time since file was opened
-    Interval(Duration),
 }
 
-impl std::str::FromStr for Rotation {
+impl std::str::FromStr for Interval {
     type Err = String;
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         let raw = raw.trim();
-        if raw.eq_ignore_ascii_case("off") {
-            return Ok(Rotation::Off);
+        match raw.parse::<Quantity>()? {
+            Quantity::Off => Ok(Interval::Off),
+            Quantity::Duration(duration) if duration.is_zero() => Err(format!(
+                "an interval duration must not be zero, got {raw:?}"
+            )),
+            Quantity::Duration(duration) => Ok(Interval::Every(duration)),
+            Quantity::Bytes(0) => Err(format!("an interval size must not be zero, got {raw:?}")),
+            Quantity::Bytes(size) => Ok(Interval::Size(size)),
+            Quantity::Count(_) => Err(format!("an interval cannot be a file count, got {raw:?}")),
         }
-        // A bare number is rejected rather than silently meaning bytes: bytesize would take it,
-        // and "100" is far more likely to be a forgotten unit than a 100 byte limit.
-        if raw.ends_with(['b', 'B']) {
-            let size = raw
-                .parse::<bytesize::ByteSize>()
-                .map_err(|e| format!("invalid rotation size {raw:?}: {e}"))?
-                .as_u64();
-            if size < 100 {
-                return Err(format!("rotation size must be bigger than {raw:?}"));
-            }
-            return Ok(Rotation::Size(size));
-        }
-        let signed: jiff::SignedDuration = raw.parse().map_err(|_| {
-            format!(
-                "expected a size like \"100MB\", a duration like \"30min\", or \"off\", got {raw:?}"
-            )
-        })?;
-        let duration = Duration::try_from(signed)
-            .map_err(|_| format!("rotation duration must not be negative, got {raw:?}"))?;
-        if duration.is_zero() {
-            return Err(format!("rotation duration must not be zero, got {raw:?}"));
-        }
-        Ok(Rotation::Interval(duration))
     }
 }
 
-impl<'de> serde::Deserialize<'de> for Rotation {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(deserializer)?;
-        raw.parse().map_err(serde::de::Error::custom)
-    }
+/// Deserialize an [Interval]: a duration, a size, or `"off"`.
+fn deserialize_interval<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Interval, D::Error> {
+    use serde::Deserialize;
+    let raw = String::deserialize(deserializer)?;
+    raw.parse().map_err(serde::de::Error::custom)
 }
 
-/// A flush or sync interval; a duration, or `"off"`.
+/// When to delete old log files from an interface's directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Interval(Option<Duration>);
+pub enum RetentionLimit {
+    Off,
+    /// Keep at most this many files.
+    Files(u64),
+    /// Delete files older than this.
+    Age(Duration),
+    /// Keep the directory's total size under this many bytes.
+    Size(u64),
+}
 
-impl<'de> serde::Deserialize<'de> for Interval {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(deserializer)?;
-        if raw == "off" {
-            return Ok(Interval(None));
+impl std::str::FromStr for RetentionLimit {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let raw = raw.trim();
+        match raw.parse::<Quantity>()? {
+            Quantity::Off => Ok(RetentionLimit::Off),
+            Quantity::Duration(age) if age.is_zero() => {
+                Err(format!("a retention age must not be zero, got {raw:?}"))
+            }
+            Quantity::Duration(age) => Ok(RetentionLimit::Age(age)),
+            Quantity::Bytes(0) => Err(format!("a retention size must not be zero, got {raw:?}")),
+            Quantity::Bytes(size) => Ok(RetentionLimit::Size(size)),
+            Quantity::Count(0) => Err(format!(
+                "a retention file count must not be zero, got {raw:?}"
+            )),
+            Quantity::Count(count) => Ok(RetentionLimit::Files(count)),
         }
-        let signed: jiff::SignedDuration = raw.parse().map_err(|_| {
-            serde::de::Error::custom(format!(
-                "expected a duration like \"5s\", \"500ms\", \"5min\", or \"off\", got {raw:?}"
-            ))
-        })?;
-        let duration = Duration::try_from(signed).map_err(|_| {
-            serde::de::Error::custom(format!("duration must not be negative, got {raw:?}"))
-        })?;
-        Ok(Interval(Some(duration)))
     }
+}
+
+/// Deserialize a [RetentionLimit]: a size, an age, a file count, or `"off"`.
+fn deserialize_retention<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<RetentionLimit, D::Error> {
+    use serde::Deserialize;
+    let raw = String::deserialize(deserializer)?;
+    raw.parse().map_err(serde::de::Error::custom)
 }
 
 /// Per-interface TOML settings.
@@ -205,9 +212,14 @@ struct RawStreamConfig {
     // This is the one TOML setting that's required; the rest have default values taken from
     // [RawStreamConfig::default].
     directory: Option<PathBuf>,
-    flush_interval: Interval,
-    sync_interval: Interval,
-    rotation: Rotation,
+    #[serde(deserialize_with = "deserialize_interval")]
+    flush_every: Interval,
+    #[serde(deserialize_with = "deserialize_interval")]
+    sync_every: Interval,
+    #[serde(deserialize_with = "deserialize_interval")]
+    rotate_every: Interval,
+    #[serde(deserialize_with = "deserialize_retention")]
+    retain: RetentionLimit,
 }
 
 impl Default for RawStreamConfig {
@@ -217,9 +229,10 @@ impl Default for RawStreamConfig {
             compress: true,
             timestamp: TimestampMode::Absolute,
             directory: None,
-            flush_interval: Interval(Some(DEFAULT_FLUSH_INTERVAL)),
-            sync_interval: Interval(Some(DEFAULT_SYNC_INTERVAL)),
-            rotation: Rotation::Interval(Duration::from_secs(30 * 60)),
+            flush_every: Interval::Every(DEFAULT_FLUSH_INTERVAL),
+            sync_every: Interval::Every(DEFAULT_SYNC_INTERVAL),
+            rotate_every: Interval::Every(Duration::from_secs(30 * 60)),
+            retain: RetentionLimit::Size(1_000_000_000),
         }
     }
 }
@@ -314,9 +327,12 @@ impl Config {
                 format: cli.format,
                 timestamp: cli.timestamp,
                 compress: cli.compress,
-                flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
-                sync_interval: Some(DEFAULT_SYNC_INTERVAL),
-                rotation: cli.rotation,
+                flush_every: Interval::Every(DEFAULT_FLUSH_INTERVAL),
+                sync_every: Interval::Every(DEFAULT_SYNC_INTERVAL),
+                rotation: cli.rotate_every,
+                // Performing retention in CLI mode would delete "foreign" files in the CWD. That's
+                // not a good idea ... don't do that.
+                retention: RetentionLimit::Off,
             })
             .collect();
 
@@ -383,6 +399,21 @@ impl Config {
                     "interface {interface}: missing `directory` setting in [interface.{interface}] or [defaults]"
                 );
             };
+            // A retention limit at or below the rotation limit can never be met. Only same-kind
+            // limits are comparable and therefore validatable; mixed kinds are best-effort.
+            match (settings.retain, settings.rotate_every) {
+                (RetentionLimit::Size(retain), Interval::Size(rotate)) if retain <= rotate => {
+                    eyre::bail!(
+                        "interface {interface}: retain ({retain} B) must be greater than rotate_every ({rotate} B)"
+                    );
+                }
+                (RetentionLimit::Age(retain), Interval::Every(rotate)) if retain <= rotate => {
+                    eyre::bail!(
+                        "interface {interface}: retain ({retain:?}) must be greater than rotate_every ({rotate:?})"
+                    );
+                }
+                _ => {}
+            }
             streams.push(StreamConfig {
                 output: Output::Template {
                     dir: directory.join(interface),
@@ -392,9 +423,10 @@ impl Config {
                 format: settings.format,
                 timestamp: settings.timestamp,
                 compress: settings.compress,
-                flush_interval: settings.flush_interval.0,
-                sync_interval: settings.sync_interval.0,
-                rotation: settings.rotation,
+                flush_every: settings.flush_every,
+                sync_every: settings.sync_every,
+                rotation: settings.rotate_every,
+                retention: settings.retain,
             });
         }
 
@@ -419,16 +451,17 @@ mod tests {
             directory = "/var/log/can"
             compress = false
             timestamp = "delta"
-            sync_interval = "off"
-            rotation = "100MB"
+            sync_every = "off"
+            rotate_every = "100MB"
 
             [interface.can1]
 
             [interface.can0]
             compress = true
             format = "candump-console"
-            flush_interval = "250ms"
-            rotation = "off"
+            flush_every = "250ms"
+            rotate_every = "off"
+            retain = "10 files"
         "#;
         let config = Config::from_toml(src).unwrap();
 
@@ -446,10 +479,11 @@ mod tests {
                     format: Format::CandumpConsole,
                     timestamp: TimestampMode::Delta,
                     compress: true,
-                    flush_interval: Some(Duration::from_millis(250)),
-                    sync_interval: None,
-                    // Overrides the inherited size, exactly like `flush_interval = "off"` next door.
-                    rotation: Rotation::Off,
+                    flush_every: Interval::Every(Duration::from_millis(250)),
+                    sync_every: Interval::Off,
+                    // Overrides the inherited size, exactly like `flush_every = "off"` next door.
+                    rotation: Interval::Off,
+                    retention: RetentionLimit::Files(10),
                 },
                 StreamConfig {
                     output: Output::Template {
@@ -460,101 +494,109 @@ mod tests {
                     format: Format::CandumpFile,
                     timestamp: TimestampMode::Delta,
                     compress: false,
-                    flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
-                    sync_interval: None,
-                    rotation: Rotation::Size(100_000_000),
+                    flush_every: Interval::Every(DEFAULT_FLUSH_INTERVAL),
+                    sync_every: Interval::Off,
+                    rotation: Interval::Size(100_000_000),
+                    retention: RetentionLimit::Size(1_000_000_000),
                 },
             ]
         );
     }
 
     #[test]
-    fn intervals_accept_durations_and_off() {
-        /// Resolve a config whose only interval is `flush_interval = <value>`.
-        fn flush_interval(value: &str) -> eyre::Result<Option<Duration>> {
+    fn intervals_accept_durations_sizes_and_off() {
+        /// Resolve a config whose only interval is `flush_every = <value>`.
+        fn flush_every(value: &str) -> eyre::Result<Interval> {
             let src = format!(
-                "[defaults]\ndirectory = \"/x\"\nflush_interval = {value:?}\n[interface.can0]\n"
+                "[defaults]\ndirectory = \"/x\"\nflush_every = {value:?}\n[interface.can0]\n"
             );
-            Ok(Config::from_toml(&src)?.streams[0].flush_interval)
+            Ok(Config::from_toml(&src)?.streams[0].flush_every)
+        }
+        fn every(duration: Duration) -> Interval {
+            Interval::Every(duration)
         }
 
-        assert_eq!(flush_interval("5s").unwrap(), Some(Duration::from_secs(5)));
+        assert_eq!(flush_every("5s").unwrap(), every(Duration::from_secs(5)));
         assert_eq!(
-            flush_interval("500ms").unwrap(),
-            Some(Duration::from_millis(500))
+            flush_every("500ms").unwrap(),
+            every(Duration::from_millis(500))
         );
         assert_eq!(
-            flush_interval("5min").unwrap(),
-            Some(Duration::from_secs(300))
+            flush_every("5min").unwrap(),
+            every(Duration::from_secs(300))
         );
         assert_eq!(
-            flush_interval("1min 30s").unwrap(),
-            Some(Duration::from_secs(90))
+            flush_every("1min 30s").unwrap(),
+            every(Duration::from_secs(90))
         );
-        assert_eq!(flush_interval("off").unwrap(), None);
+        assert_eq!(flush_every("64KB").unwrap(), Interval::Size(64_000));
+        assert_eq!(flush_every("off").unwrap(), Interval::Off);
 
-        let err = format!("{:#}", flush_interval("soon").unwrap_err());
-        assert!(err.contains("expected a duration like"), "got: {err}");
-        let err = format!("{:#}", flush_interval("-3s").unwrap_err());
+        let err = format!("{:#}", flush_every("soon").unwrap_err());
+        assert!(err.contains("a duration like"), "got: {err}");
+        let err = format!("{:#}", flush_every("-3s").unwrap_err());
         assert!(err.contains("must not be negative"), "got: {err}");
+        let err = format!("{:#}", flush_every("2 files").unwrap_err());
+        assert!(err.contains("cannot be a file count"), "got: {err}");
     }
 
     #[test]
-    fn rotation_tells_sizes_and_durations_apart() {
-        fn rotation(value: &str) -> Result<Rotation, String> {
+    fn interval_tells_sizes_and_durations_apart() {
+        fn interval(value: &str) -> Result<Interval, String> {
             value.parse()
         }
-        fn size(bytes: u64) -> Result<Rotation, String> {
-            Ok(Rotation::Size(bytes))
+        fn size(bytes: u64) -> Result<Interval, String> {
+            Ok(Interval::Size(bytes))
         }
-        fn secs(secs: u64) -> Result<Rotation, String> {
-            Ok(Rotation::Interval(Duration::from_secs(secs)))
+        fn secs(secs: u64) -> Result<Interval, String> {
+            Ok(Interval::Every(Duration::from_secs(secs)))
         }
 
         // The two that pin the discriminator: a trailing `b` is the only difference.
-        assert_eq!(rotation("1m"), secs(60));
-        assert_eq!(rotation("1MB"), size(1_000_000));
+        assert_eq!(interval("1m"), secs(60));
+        assert_eq!(interval("1MB"), size(1_000_000));
 
-        assert_eq!(rotation("100MB"), size(100_000_000));
-        assert_eq!(rotation("100MiB"), size(104_857_600));
-        assert_eq!(rotation("1.5GB"), size(1_500_000_000));
-        assert_eq!(rotation("100 mb"), size(100_000_000));
-        assert_eq!(rotation("512b"), size(512));
+        assert_eq!(interval("100MB"), size(100_000_000));
+        assert_eq!(interval("100MiB"), size(104_857_600));
+        assert_eq!(interval("1.5GB"), size(1_500_000_000));
+        assert_eq!(interval("100 mb"), size(100_000_000));
+        assert_eq!(interval("512b"), size(512));
 
-        assert_eq!(rotation("30min"), secs(1800));
-        assert_eq!(rotation("1h"), secs(3600));
-        assert_eq!(rotation("90s"), secs(90));
-        assert_eq!(rotation("1min 30s"), secs(90));
+        assert_eq!(interval("30min"), secs(1800));
+        assert_eq!(interval("1h"), secs(3600));
+        assert_eq!(interval("90s"), secs(90));
+        assert_eq!(interval("1min 30s"), secs(90));
+        assert_eq!(interval("1 day"), secs(24 * 3600));
+        assert_eq!(interval("2 weeks"), secs(24 * 3600 * 7 * 2));
 
-        assert_eq!(rotation("off"), Ok(Rotation::Off));
-        assert_eq!(rotation("OFF"), Ok(Rotation::Off));
+        assert_eq!(interval("off"), Ok(Interval::Off));
+        assert_eq!(interval("OFF"), Ok(Interval::Off));
 
         // A bare number is a forgotten unit, not 100 bytes, so the error names both forms.
-        let err = rotation("100").unwrap_err();
+        let err = interval("100").unwrap_err();
         assert!(err.contains("expected a size like"), "got: {err}");
-        let err = rotation("soon").unwrap_err();
+        let err = interval("soon").unwrap_err();
         assert!(err.contains("expected a size like"), "got: {err}");
 
-        // Sizes have a floor, not just a nonzero check. 100 bytes is the first accepted value.
-        assert_eq!(rotation("100b"), size(100));
-        let err = rotation("99b").unwrap_err();
-        assert!(err.contains("must be bigger than"), "got: {err}");
-        let err = rotation("0MB").unwrap_err();
-        assert!(err.contains("must be bigger than"), "got: {err}");
+        // Zero means "off", and we don't guess: both zero forms are rejected.
+        let err = interval("0MB").unwrap_err();
+        assert!(err.contains("size must not be zero"), "got: {err}");
         assert!(
-            rotation("0s")
+            interval("0s")
                 .unwrap_err()
                 .contains("duration must not be zero")
         );
         assert!(
-            rotation("-3s")
+            interval("-3s")
                 .unwrap_err()
                 .contains("duration must not be negative")
         );
+        let err = interval("10 files").unwrap_err();
+        assert!(err.contains("cannot be a file count"), "got: {err}");
     }
 
     #[test]
-    fn resolution_rejects_incomplete_configs() {
+    fn resolution_rejects_invalid_configs() {
         let err = format!(
             "{:#}",
             Config::from_toml("[defaults]\ncompress = true\n[interface.can0]\n").unwrap_err()
@@ -572,5 +614,23 @@ mod tests {
 
         let err = format!("{:#}", Config::from_toml("[interface]\n").unwrap_err());
         assert!(err.contains("at least one is required"), "got: {err}");
+
+        let err = format!(
+            "{:#}",
+            Config::from_toml(
+                "[defaults]\ndirectory = \"/x\"\nrotate_every = \"200KB\"\nretain = \"100KB\"\n[interface.can0]\n"
+            )
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("can0") && err.contains("must be greater than rotate_every"),
+            "got: {err}"
+        );
+
+        // Mixed kinds are not comparable; accepted and enforced best-effort.
+        Config::from_toml(
+            "[defaults]\ndirectory = \"/x\"\nrotate_every = \"200KB\"\nretain = \"1 day\"\n[interface.can0]\n"
+        )
+        .unwrap();
     }
 }

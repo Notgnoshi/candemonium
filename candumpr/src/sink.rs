@@ -2,8 +2,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::config::Rotation;
+use crate::config::{Interval, RetentionLimit};
 use crate::recv::Timestamp;
+use crate::retention::RetentionPolicy;
 use crate::template;
 use crate::writer::{FileWriter, StdoutWriter, Writer, ZstdWriter};
 
@@ -30,15 +31,18 @@ pub struct SinkConfig {
     // TODO: When the header includes dynamic data (like timestamp in ASC), we'll need to generate
     // the header on the first formatted frame the sink receives from the formatter.
     pub header: Option<Vec<u8>>,
-    pub flush_threshold_bytes: usize,
-    pub flush_interval: Option<Duration>,
-    pub sync_interval: Option<Duration>,
+    /// When to flush the writer: on a timer, on a byte count, or not at all.
+    pub flush_every: Interval,
+    /// When to sync the writer. A sync always flushes first.
+    pub sync_every: Interval,
     /// Whether activation failures that waiting could heal are retried, or should be fatal.
     pub retry_activation_failures: bool,
     /// Compress file output with zstd. Ignored for [Output::Stdout].
     pub compress: bool,
     /// When to finalize the current file and start a new one.
-    pub rotation: Rotation,
+    pub rotation: Interval,
+    /// When to delete old files from the output directory. Only applies to [Output::Template].
+    pub retention: RetentionLimit,
 }
 
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
@@ -49,12 +53,12 @@ impl SinkConfig {
         SinkConfig {
             output,
             header: None,
-            flush_threshold_bytes: 64 * 1024,
-            flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
-            sync_interval: Some(DEFAULT_SYNC_INTERVAL),
+            flush_every: Interval::Every(DEFAULT_FLUSH_INTERVAL),
+            sync_every: Interval::Every(DEFAULT_SYNC_INTERVAL),
             retry_activation_failures: false,
             compress: false,
-            rotation: Rotation::Off,
+            rotation: Interval::Off,
+            retention: RetentionLimit::Off,
         }
     }
 
@@ -80,15 +84,12 @@ impl SinkConfig {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let file = FileWriter::new(std::fs::File::create(&path)?);
+        let file = FileWriter::new(std::fs::File::create(&path)?, path.clone());
         tracing::info!(path = %path.display(), "created log file");
         if self.compress {
             Ok(Box::new(ZstdWriter::new(file)?))
         } else {
-            Ok(Box::new(std::io::BufWriter::with_capacity(
-                self.flush_threshold_bytes,
-                file,
-            )))
+            Ok(Box::new(std::io::BufWriter::new(file)))
         }
     }
 }
@@ -97,6 +98,7 @@ impl SinkConfig {
 pub struct Sink {
     config: SinkConfig,
     pub(crate) state: SinkState,
+    retention: Option<RetentionPolicy>,
 }
 
 /// Minimum time between activation attempts after a failed activation.
@@ -113,6 +115,7 @@ pub(crate) enum SinkState {
     Active {
         writer: Box<dyn Writer>,
         bytes_since_flush: usize,
+        bytes_since_sync: usize,
         last_flush: Instant,
         last_sync: Instant,
         opened_at: Instant,
@@ -123,9 +126,20 @@ pub(crate) enum SinkState {
 impl Sink {
     /// Construct a Sink in the Pending state. Does no I/O.
     pub fn new(config: SinkConfig) -> Self {
+        let retention = match &config.output {
+            // In daemon mode, candumpr creates the <output dir>/<interface dir>/ directory, which
+            // gives candumpr exclusive ownership of its contents. That makes it safe for the
+            // RetentionPolicy to delete files in it. In CLI mode however, candumpr writes files to
+            // the CWD, which we DO NOT want to delete files from.
+            Output::Template { dir, .. } => {
+                Some(RetentionPolicy::new(config.retention, dir.clone()))
+            }
+            Output::Stdout | Output::Path(_) => None,
+        };
         Self {
             config,
             state: SinkState::Pending { last_attempt: None },
+            retention,
         }
     }
 
@@ -149,6 +163,7 @@ impl Sink {
         }
 
         let mut wrote = 0;
+        let mut just_activated = false;
 
         if let SinkState::Pending { last_attempt } = &self.state {
             if let Some(prev) = last_attempt
@@ -187,28 +202,54 @@ impl Sink {
             self.state = SinkState::Active {
                 writer,
                 bytes_since_flush: 0,
+                bytes_since_sync: 0,
                 last_flush: now,
                 last_sync: now,
                 opened_at: now,
             };
+            just_activated = true;
         }
 
         let SinkState::Active {
             writer,
             bytes_since_flush,
+            bytes_since_sync,
             last_flush,
+            last_sync,
             ..
         } = &mut self.state
         else {
             unreachable!("state must be Active after the Pending branch above");
         };
+        if just_activated
+            && let Some(policy) = &mut self.retention
+            && let Some(path) = writer.path()
+        {
+            policy.activated(path)?;
+        }
         writer.write_all(bytes)?;
         wrote += bytes.len();
         *bytes_since_flush += wrote;
-        if *bytes_since_flush >= self.config.flush_threshold_bytes {
+        *bytes_since_sync += wrote;
+        if let Interval::Size(limit) = self.config.sync_every
+            && *bytes_since_sync as u64 >= limit
+        {
+            writer.sync()?;
+            *bytes_since_flush = 0;
+            *bytes_since_sync = 0;
+            let now = Instant::now();
+            *last_flush = now;
+            *last_sync = now;
+        } else if let Interval::Size(limit) = self.config.flush_every
+            && *bytes_since_flush as u64 >= limit
+        {
             writer.flush()?;
             *bytes_since_flush = 0;
             *last_flush = Instant::now();
+        }
+
+        if let Some(policy) = &mut self.retention {
+            policy.wrote(writer.bytes_written())?;
         }
 
         if self.should_rotate(Instant::now()) {
@@ -230,9 +271,9 @@ impl Sink {
             return false;
         };
         match self.config.rotation {
-            Rotation::Off => false,
-            Rotation::Size(limit) => writer.bytes_written() >= limit,
-            Rotation::Interval(limit) => now.duration_since(*opened_at) >= limit,
+            Interval::Off => false,
+            Interval::Size(limit) => writer.bytes_written() >= limit,
+            Interval::Every(limit) => now.duration_since(*opened_at) >= limit,
         }
     }
 
@@ -250,6 +291,7 @@ impl Sink {
         let SinkState::Active {
             writer,
             bytes_since_flush,
+            bytes_since_sync,
             last_flush,
             last_sync,
             ..
@@ -258,17 +300,18 @@ impl Sink {
             return Ok(());
         };
 
-        if let Some(d) = self.config.sync_interval
+        if let Interval::Every(d) = self.config.sync_every
             && now.duration_since(*last_sync) >= d
         {
             writer.sync()?;
             *bytes_since_flush = 0;
+            *bytes_since_sync = 0;
             *last_flush = now;
             *last_sync = now;
             return Ok(());
         }
 
-        if let Some(d) = self.config.flush_interval
+        if let Interval::Every(d) = self.config.flush_every
             && now.duration_since(*last_flush) >= d
         {
             writer.flush()?;
@@ -301,6 +344,7 @@ impl Sink {
         let SinkState::Active {
             writer,
             bytes_since_flush,
+            bytes_since_sync,
             last_flush,
             last_sync,
             ..
@@ -310,6 +354,7 @@ impl Sink {
         };
         writer.sync()?;
         *bytes_since_flush = 0;
+        *bytes_since_sync = 0;
         let now = Instant::now();
         *last_flush = now;
         *last_sync = now;
@@ -392,8 +437,8 @@ mod tests {
             interface: "can0".to_string(),
             ext: "log".to_string(),
         });
-        config.flush_interval = None;
-        config.sync_interval = None;
+        config.flush_every = Interval::Off;
+        config.sync_every = Interval::Off;
         let mut sink = Sink::new(config);
 
         assert!(sink.write(b"PAYLOAD", ts(42)).is_err());
@@ -407,8 +452,8 @@ mod tests {
             ext: "log".to_string(),
         });
         config.header = header;
-        config.flush_interval = None;
-        config.sync_interval = None;
+        config.flush_every = Interval::Off;
+        config.sync_every = Interval::Off;
         Sink::new(config)
     }
 
@@ -481,8 +526,8 @@ mod tests {
         std::fs::write(&path, b"LEFTOVER FROM AN EARLIER RUN").unwrap();
 
         let mut config = SinkConfig::new(Output::Path(path.clone()));
-        config.flush_interval = None;
-        config.sync_interval = None;
+        config.flush_every = Interval::Off;
+        config.sync_every = Interval::Off;
         let mut sink = Sink::new(config);
         sink.write(b"PAYLOAD", ts(42)).unwrap();
         sink.flush().unwrap();
@@ -558,15 +603,15 @@ mod tests {
         assert_eq!(std::fs::read(&paths[1]).unwrap(), b"HDRSECOND");
     }
 
-    fn rotating_sink_in(dir: &TempDir, rotation: Rotation) -> Sink {
+    fn rotating_sink_in(dir: &TempDir, rotation: Interval) -> Sink {
         let mut config = SinkConfig::new(Output::Template {
             dir: dir.path().to_path_buf(),
             interface: "can0".to_string(),
             ext: "log".to_string(),
         });
-        config.flush_interval = None;
-        config.sync_interval = None;
-        config.flush_threshold_bytes = 1;
+        // Every byte lands on disk immediately, so the tests can read files mid-stream.
+        config.flush_every = Interval::Size(1);
+        config.sync_every = Interval::Off;
         config.rotation = rotation;
         Sink::new(config)
     }
@@ -574,7 +619,7 @@ mod tests {
     #[test]
     fn size_rotation_starts_a_new_file_once_the_limit_is_crossed() {
         let dir = TempDir::new().unwrap();
-        let mut sink = rotating_sink_in(&dir, Rotation::Size(100));
+        let mut sink = rotating_sink_in(&dir, Interval::Size(100));
         let half = [b'A'; 50];
 
         sink.write(&half, ts(1732117385)).unwrap();
@@ -599,7 +644,7 @@ mod tests {
     #[test]
     fn duration_rotation_fires_from_tick() {
         let dir = TempDir::new().unwrap();
-        let mut sink = rotating_sink_in(&dir, Rotation::Interval(Duration::from_millis(1)));
+        let mut sink = rotating_sink_in(&dir, Interval::Every(Duration::from_millis(1)));
 
         sink.write(b"PAYLOAD", ts(1732117385)).unwrap();
         assert!(matches!(sink.state, SinkState::Active { .. }));
@@ -618,8 +663,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("can.log");
         let mut config = SinkConfig::new(Output::Path(path.clone()));
-        config.flush_interval = None;
-        config.sync_interval = None;
+        config.flush_every = Interval::Off;
+        config.sync_every = Interval::Off;
         let mut sink = Sink::new(config);
 
         sink.write(b"FIRST", ts(42)).unwrap();
