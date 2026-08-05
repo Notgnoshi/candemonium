@@ -45,16 +45,16 @@ Each of the `[defaults]` and `[interface.<name>]` tables support the following k
 | `format`       | `"candump-file"` | One of: `"candump-file"` or `"candump-console"`                            |
 | `compress`     | `true`           | Compress the log files with zstd                                           |
 | `timestamp`    | `"absolute"`     | Timestamp mode: `"absolute"`, `"delta"`, or `"zero"`                       |
-| `flush_every`  | `"5s"`           | Upper bound between flushes. `"off"` disables periodic flushing            |
-| `sync_every`   | `"5min"`         | Upper bound between fsyncs. `"off"` disables periodic syncing              |
-| `rotate_every` | `"30min"`        | Rotate the log once it exceeds a size or an age. `"off"` disables rotation |
+| `flush_every`  | `"5s"`           | Periodic flush interval: a time duration or a size                         |
+| `sync_every`   | `"5min"`         | Periodic fsync interval: a time duration or a size                         |
+| `rotate_every` | `"30min"`        | Rotate the log once it exceeds a size or an age                            |
 
 Durations are parsed using
 [jiff's friendly format](https://docs.rs/jiff/latest/jiff/fmt/friendly/index.html). Days and weeks
 are also accepted.
 
-The `rotate_every` parameter can accept durations or sizes. Examples: `512B`, `100 MiB`, `1 gb`,
-`1m` (1 minute), `30 minutes`, `1 day`, `off`.
+The `rotate_every`, `flush_every`, and `sync_every` parameters accept durations or sizes. Examples:
+`512B`, `100 MiB`, `1 gb`, `1m` (1 minute), `30 minutes`, `1 day`, `off`.
 
 ## Output files
 

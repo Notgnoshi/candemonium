@@ -198,8 +198,8 @@ fn main() -> ExitCode {
             let mut sink = SinkConfig::new(stream.output);
             sink.header = formatter.header().map(|h| h.to_vec());
             sink.compress = stream.compress;
-            sink.flush_interval = stream.flush_interval;
-            sink.sync_interval = stream.sync_interval;
+            sink.flush_every = stream.flush_every;
+            sink.sync_every = stream.sync_every;
             sink.rotation = stream.rotation;
             sink.retry_activation_failures = retry_activation_failures;
             (formatter, Sink::new(sink))

@@ -155,8 +155,8 @@ The `[defaults]` section provides base values that all interfaces inherit from. 
 | `address_claim` | boolean           | `false`          | Send J1939 address claim PGN request on rotation                                        |
 | `error_frames`  | boolean           | `true`           | Log error frames                                                                        |
 | `filters`       | array of strings  | `[]`             | candump-style filters                                                                   |
-| `flush_every`   | string            | `"5s"`           | Upper bound between `flush` calls. `"off"` disables time-based flush                    |
-| `sync_every`    | string            | `"5min"`         | Upper bound between `sync` calls. `"off"` disables periodic sync                        |
+| `flush_every`   | string            | `"5s"`           | Flush interval: a duration or a size. `"off"` disables automatic flush                  |
+| `sync_every`    | string            | `"5min"`         | Sync interval: a duration or a size. `"off"` disables periodic sync                     |
 | `rotate_every`  | string            | `"30min"`        | Rotation trigger: a size (e.g. `"100MB"`) or a duration (e.g. `"1h"`). `"off"` disables |
 
 ## Rotation

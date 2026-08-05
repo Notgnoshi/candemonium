@@ -122,6 +122,7 @@ mod tests {
 
     use super::*;
     use crate::can::LinuxCanFrame;
+    use crate::config::Interval;
     use crate::format::{CanutilsFileFormatter, TimestampMode};
     use crate::frame::Direction;
     use crate::sink::{Output, Sink, SinkConfig};
@@ -141,8 +142,8 @@ mod tests {
     /// A Path-output Sink writing to `sink<i>.log` in `dir`, with time-based flush/sync disabled.
     fn sink(dir: &TempDir, i: usize) -> Sink {
         let mut config = SinkConfig::new(Output::Path(dir.path().join(format!("sink{i}.log"))));
-        config.flush_interval = None;
-        config.sync_interval = None;
+        config.flush_every = Interval::Off;
+        config.sync_every = Interval::Off;
         Sink::new(config)
     }
 
