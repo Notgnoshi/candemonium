@@ -5,6 +5,7 @@ pub mod errframe;
 pub mod format;
 pub mod frame;
 pub mod pipeline;
+pub mod quantity;
 pub mod recv;
 pub mod sink;
 pub mod template;
