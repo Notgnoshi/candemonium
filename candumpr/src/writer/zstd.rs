@@ -91,6 +91,10 @@ impl<W: Writer> Writer for ZstdWriter<W> {
     fn bytes_written(&self) -> u64 {
         self.inner.bytes_written()
     }
+
+    fn path(&self) -> Option<&std::path::Path> {
+        self.inner.path()
+    }
 }
 
 #[cfg(test)]
@@ -151,6 +155,10 @@ mod tests {
         fn bytes_written(&self) -> u64 {
             self.bytes.len() as u64
         }
+
+        fn path(&self) -> Option<&std::path::Path> {
+            None
+        }
     }
 
     // happy path
@@ -159,7 +167,11 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let batches = batches(0..1000);
 
-        let mut writer = ZstdWriter::new(FileWriter::new(file.reopen().unwrap())).unwrap();
+        let mut writer = ZstdWriter::new(FileWriter::new(
+            file.reopen().unwrap(),
+            file.path().to_path_buf(),
+        ))
+        .unwrap();
         for batch in &batches {
             writer.write_all(batch).unwrap();
         }

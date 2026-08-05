@@ -3,6 +3,7 @@ mod stdout;
 mod zstd;
 
 use std::io::Write;
+use std::path::Path;
 
 pub use file::FileWriter;
 pub use stdout::StdoutWriter;
@@ -32,6 +33,9 @@ pub trait Writer: std::io::Write {
     /// passed into the writer to write. [ZstdWriter] is an example of a writer where bytes in !=
     /// bytes out.
     fn bytes_written(&self) -> u64;
+
+    /// The filesystem path this writer writes to, if it has one.
+    fn path(&self) -> Option<&Path>;
 }
 
 impl<W: Writer + 'static> Writer for std::io::BufWriter<W> {
@@ -47,5 +51,9 @@ impl<W: Writer + 'static> Writer for std::io::BufWriter<W> {
 
     fn bytes_written(&self) -> u64 {
         self.get_ref().bytes_written()
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.get_ref().path()
     }
 }

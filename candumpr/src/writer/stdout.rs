@@ -45,4 +45,8 @@ impl Writer for StdoutWriter {
     fn bytes_written(&self) -> u64 {
         self.written
     }
+
+    fn path(&self) -> Option<&std::path::Path> {
+        None
+    }
 }

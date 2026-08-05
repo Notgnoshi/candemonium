@@ -80,7 +80,7 @@ impl SinkConfig {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let file = FileWriter::new(std::fs::File::create(&path)?);
+        let file = FileWriter::new(std::fs::File::create(&path)?, path.clone());
         tracing::info!(path = %path.display(), "created log file");
         if self.compress {
             Ok(Box::new(ZstdWriter::new(file)?))

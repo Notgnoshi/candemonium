@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use super::Writer;
 
@@ -7,15 +8,21 @@ use super::Writer;
 /// Use [std::io::BufWriter] for buffering, if desired.
 pub struct FileWriter {
     file: std::fs::File,
+    path: PathBuf,
     written: u64,
 }
 
 impl FileWriter {
     /// Create a new file writer from a pre-opened file
     ///
-    /// This lets the caller decide the open options.
-    pub fn new(file: std::fs::File) -> Self {
-        Self { file, written: 0 }
+    /// This lets the caller decide the open options. `path` is where the caller opened the file;
+    /// it is only reported back through [Writer::path], never reopened.
+    pub fn new(file: std::fs::File, path: PathBuf) -> Self {
+        Self {
+            file,
+            path,
+            written: 0,
+        }
     }
 }
 
@@ -43,5 +50,9 @@ impl Writer for FileWriter {
 
     fn bytes_written(&self) -> u64 {
         self.written
+    }
+
+    fn path(&self) -> Option<&Path> {
+        Some(&self.path)
     }
 }
