@@ -13,6 +13,9 @@ pub mod writer;
 #[cfg(test)]
 #[ctor::ctor]
 fn test_setup() {
-    tracing_subscriber::fmt().with_test_writer().init();
+    tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_ansi(true)
+        .init();
     vcan_fixture::enter_namespace();
 }
