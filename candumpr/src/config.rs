@@ -6,6 +6,7 @@ use clap::Parser;
 use eyre::WrapErr;
 
 use crate::format::TimestampMode;
+use crate::quantity::Quantity;
 use crate::sink::{DEFAULT_FLUSH_INTERVAL, DEFAULT_SYNC_INTERVAL, Output};
 
 /// The first interface name that appears more than once.
@@ -132,32 +133,19 @@ impl std::str::FromStr for Rotation {
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         let raw = raw.trim();
-        if raw.eq_ignore_ascii_case("off") {
-            return Ok(Rotation::Off);
-        }
-        // A bare number is rejected rather than silently meaning bytes: bytesize would take it,
-        // and "100" is far more likely to be a forgotten unit than a 100 byte limit.
-        if raw.ends_with(['b', 'B']) {
-            let size = raw
-                .parse::<bytesize::ByteSize>()
-                .map_err(|e| format!("invalid rotation size {raw:?}: {e}"))?
-                .as_u64();
-            if size < 100 {
-                return Err(format!("rotation size must be bigger than {raw:?}"));
+        match raw.parse::<Quantity>()? {
+            Quantity::Off => Ok(Rotation::Off),
+            // A small size rotation trigger is very likely a typo.
+            Quantity::Bytes(size) if size < 100 => {
+                Err(format!("size must be bigger than 100B, got: {raw:?}"))
             }
-            return Ok(Rotation::Size(size));
+            Quantity::Bytes(size) => Ok(Rotation::Size(size)),
+            Quantity::Duration(duration) if duration.is_zero() => {
+                Err(format!("rotation duration must not be zero, got: {raw:?}"))
+            }
+            Quantity::Duration(duration) => Ok(Rotation::Interval(duration)),
+            Quantity::Count(_) => Err("rotation trigger cannot be a file count".into()),
         }
-        let signed: jiff::SignedDuration = raw.parse().map_err(|_| {
-            format!(
-                "expected a size like \"100MB\", a duration like \"30min\", or \"off\", got {raw:?}"
-            )
-        })?;
-        let duration = Duration::try_from(signed)
-            .map_err(|_| format!("rotation duration must not be negative, got {raw:?}"))?;
-        if duration.is_zero() {
-            return Err(format!("rotation duration must not be zero, got {raw:?}"));
-        }
-        Ok(Rotation::Interval(duration))
     }
 }
 
@@ -168,25 +156,21 @@ impl<'de> serde::Deserialize<'de> for Rotation {
     }
 }
 
-/// A flush or sync interval; a duration, or `"off"`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Interval(Option<Duration>);
-
-impl<'de> serde::Deserialize<'de> for Interval {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(deserializer)?;
-        if raw == "off" {
-            return Ok(Interval(None));
-        }
-        let signed: jiff::SignedDuration = raw.parse().map_err(|_| {
-            serde::de::Error::custom(format!(
-                "expected a duration like \"5s\", \"500ms\", \"5min\", or \"off\", got {raw:?}"
-            ))
-        })?;
-        let duration = Duration::try_from(signed).map_err(|_| {
-            serde::de::Error::custom(format!("duration must not be negative, got {raw:?}"))
-        })?;
-        Ok(Interval(Some(duration)))
+/// Deserialize a flush or sync interval: a duration, or `"off"`.
+fn deserialize_interval<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Duration>, D::Error> {
+    use serde::Deserialize;
+    let raw = String::deserialize(deserializer)?;
+    match raw.parse::<Quantity>().map_err(serde::de::Error::custom)? {
+        Quantity::Off => Ok(None),
+        Quantity::Duration(duration) => Ok(Some(duration)),
+        Quantity::Bytes(_) => Err(serde::de::Error::custom(format!(
+            "size-based intervals are not yet supported, got {raw:?}"
+        ))),
+        Quantity::Count(_) => Err(serde::de::Error::custom(format!(
+            "an interval cannot be a file count, got {raw:?}"
+        ))),
     }
 }
 
@@ -205,8 +189,10 @@ struct RawStreamConfig {
     // This is the one TOML setting that's required; the rest have default values taken from
     // [RawStreamConfig::default].
     directory: Option<PathBuf>,
-    flush_interval: Interval,
-    sync_interval: Interval,
+    #[serde(deserialize_with = "deserialize_interval")]
+    flush_interval: Option<Duration>,
+    #[serde(deserialize_with = "deserialize_interval")]
+    sync_interval: Option<Duration>,
     rotation: Rotation,
 }
 
@@ -217,8 +203,8 @@ impl Default for RawStreamConfig {
             compress: true,
             timestamp: TimestampMode::Absolute,
             directory: None,
-            flush_interval: Interval(Some(DEFAULT_FLUSH_INTERVAL)),
-            sync_interval: Interval(Some(DEFAULT_SYNC_INTERVAL)),
+            flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
+            sync_interval: Some(DEFAULT_SYNC_INTERVAL),
             rotation: Rotation::Interval(Duration::from_secs(30 * 60)),
         }
     }
@@ -392,8 +378,8 @@ impl Config {
                 format: settings.format,
                 timestamp: settings.timestamp,
                 compress: settings.compress,
-                flush_interval: settings.flush_interval.0,
-                sync_interval: settings.sync_interval.0,
+                flush_interval: settings.flush_interval,
+                sync_interval: settings.sync_interval,
                 rotation: settings.rotation,
             });
         }
@@ -494,9 +480,11 @@ mod tests {
         assert_eq!(flush_interval("off").unwrap(), None);
 
         let err = format!("{:#}", flush_interval("soon").unwrap_err());
-        assert!(err.contains("expected a duration like"), "got: {err}");
+        assert!(err.contains("a duration like"), "got: {err}");
         let err = format!("{:#}", flush_interval("-3s").unwrap_err());
         assert!(err.contains("must not be negative"), "got: {err}");
+        let err = format!("{:#}", flush_interval("64KB").unwrap_err());
+        assert!(err.contains("not yet supported"), "got: {err}");
     }
 
     #[test]
@@ -525,6 +513,8 @@ mod tests {
         assert_eq!(rotation("1h"), secs(3600));
         assert_eq!(rotation("90s"), secs(90));
         assert_eq!(rotation("1min 30s"), secs(90));
+        assert_eq!(rotation("1 day"), secs(24 * 3600));
+        assert_eq!(rotation("2 weeks"), secs(24 * 3600 * 7 * 2));
 
         assert_eq!(rotation("off"), Ok(Rotation::Off));
         assert_eq!(rotation("OFF"), Ok(Rotation::Off));
@@ -551,6 +541,8 @@ mod tests {
                 .unwrap_err()
                 .contains("duration must not be negative")
         );
+        let err = rotation("10 files").unwrap_err();
+        assert!(err.contains("cannot be a file count"), "got: {err}");
     }
 
     #[test]
