@@ -115,6 +115,7 @@ pub struct StreamConfig {
     pub flush_every: Interval,
     pub sync_every: Interval,
     pub rotation: Interval,
+    pub retention: RetentionLimit,
 }
 
 /// How often a periodic event occurs
@@ -154,6 +155,48 @@ fn deserialize_interval<'de, D: serde::Deserializer<'de>>(
     raw.parse().map_err(serde::de::Error::custom)
 }
 
+/// When to delete old log files from an interface's directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetentionLimit {
+    Off,
+    /// Keep at most this many files.
+    Files(u64),
+    /// Delete files older than this.
+    Age(Duration),
+    /// Keep the directory's total size under this many bytes.
+    Size(u64),
+}
+
+impl std::str::FromStr for RetentionLimit {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let raw = raw.trim();
+        match raw.parse::<Quantity>()? {
+            Quantity::Off => Ok(RetentionLimit::Off),
+            Quantity::Duration(age) if age.is_zero() => {
+                Err(format!("a retention age must not be zero, got {raw:?}"))
+            }
+            Quantity::Duration(age) => Ok(RetentionLimit::Age(age)),
+            Quantity::Bytes(0) => Err(format!("a retention size must not be zero, got {raw:?}")),
+            Quantity::Bytes(size) => Ok(RetentionLimit::Size(size)),
+            Quantity::Count(0) => Err(format!(
+                "a retention file count must not be zero, got {raw:?}"
+            )),
+            Quantity::Count(count) => Ok(RetentionLimit::Files(count)),
+        }
+    }
+}
+
+/// Deserialize a [RetentionLimit]: a size, an age, a file count, or `"off"`.
+fn deserialize_retention<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<RetentionLimit, D::Error> {
+    use serde::Deserialize;
+    let raw = String::deserialize(deserializer)?;
+    raw.parse().map_err(serde::de::Error::custom)
+}
+
 /// Per-interface TOML settings.
 ///
 /// This is the `[defaults]` and each `[interface.<name>]` table.
@@ -175,6 +218,8 @@ struct RawStreamConfig {
     sync_every: Interval,
     #[serde(deserialize_with = "deserialize_interval")]
     rotate_every: Interval,
+    #[serde(deserialize_with = "deserialize_retention")]
+    retain: RetentionLimit,
 }
 
 impl Default for RawStreamConfig {
@@ -187,6 +232,7 @@ impl Default for RawStreamConfig {
             flush_every: Interval::Every(DEFAULT_FLUSH_INTERVAL),
             sync_every: Interval::Every(DEFAULT_SYNC_INTERVAL),
             rotate_every: Interval::Every(Duration::from_secs(30 * 60)),
+            retain: RetentionLimit::Size(1_000_000_000),
         }
     }
 }
@@ -284,6 +330,9 @@ impl Config {
                 flush_every: Interval::Every(DEFAULT_FLUSH_INTERVAL),
                 sync_every: Interval::Every(DEFAULT_SYNC_INTERVAL),
                 rotation: cli.rotate_every,
+                // Performing retention in CLI mode would delete "foreign" files in the CWD. That's
+                // not a good idea ... don't do that.
+                retention: RetentionLimit::Off,
             })
             .collect();
 
@@ -350,6 +399,21 @@ impl Config {
                     "interface {interface}: missing `directory` setting in [interface.{interface}] or [defaults]"
                 );
             };
+            // A retention limit at or below the rotation limit can never be met. Only same-kind
+            // limits are comparable and therefore validatable; mixed kinds are best-effort.
+            match (settings.retain, settings.rotate_every) {
+                (RetentionLimit::Size(retain), Interval::Size(rotate)) if retain <= rotate => {
+                    eyre::bail!(
+                        "interface {interface}: retain ({retain} B) must be greater than rotate_every ({rotate} B)"
+                    );
+                }
+                (RetentionLimit::Age(retain), Interval::Every(rotate)) if retain <= rotate => {
+                    eyre::bail!(
+                        "interface {interface}: retain ({retain:?}) must be greater than rotate_every ({rotate:?})"
+                    );
+                }
+                _ => {}
+            }
             streams.push(StreamConfig {
                 output: Output::Template {
                     dir: directory.join(interface),
@@ -362,6 +426,7 @@ impl Config {
                 flush_every: settings.flush_every,
                 sync_every: settings.sync_every,
                 rotation: settings.rotate_every,
+                retention: settings.retain,
             });
         }
 
@@ -396,6 +461,7 @@ mod tests {
             format = "candump-console"
             flush_every = "250ms"
             rotate_every = "off"
+            retain = "10 files"
         "#;
         let config = Config::from_toml(src).unwrap();
 
@@ -417,6 +483,7 @@ mod tests {
                     sync_every: Interval::Off,
                     // Overrides the inherited size, exactly like `flush_every = "off"` next door.
                     rotation: Interval::Off,
+                    retention: RetentionLimit::Files(10),
                 },
                 StreamConfig {
                     output: Output::Template {
@@ -430,6 +497,7 @@ mod tests {
                     flush_every: Interval::Every(DEFAULT_FLUSH_INTERVAL),
                     sync_every: Interval::Off,
                     rotation: Interval::Size(100_000_000),
+                    retention: RetentionLimit::Size(1_000_000_000),
                 },
             ]
         );
@@ -528,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn resolution_rejects_incomplete_configs() {
+    fn resolution_rejects_invalid_configs() {
         let err = format!(
             "{:#}",
             Config::from_toml("[defaults]\ncompress = true\n[interface.can0]\n").unwrap_err()
@@ -546,5 +614,23 @@ mod tests {
 
         let err = format!("{:#}", Config::from_toml("[interface]\n").unwrap_err());
         assert!(err.contains("at least one is required"), "got: {err}");
+
+        let err = format!(
+            "{:#}",
+            Config::from_toml(
+                "[defaults]\ndirectory = \"/x\"\nrotate_every = \"200KB\"\nretain = \"100KB\"\n[interface.can0]\n"
+            )
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("can0") && err.contains("must be greater than rotate_every"),
+            "got: {err}"
+        );
+
+        // Mixed kinds are not comparable; accepted and enforced best-effort.
+        Config::from_toml(
+            "[defaults]\ndirectory = \"/x\"\nrotate_every = \"200KB\"\nretain = \"1 day\"\n[interface.can0]\n"
+        )
+        .unwrap();
     }
 }

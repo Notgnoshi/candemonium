@@ -124,16 +124,12 @@ rcvbuf = 212992
 address_claim = false
 error_frames = true
 rotate_every = "100MB"
-
-[defaults.retention]
-limit = "1GB"
+retain = "1GB"
 
 [interface.can0]
 filters = ["0x18FE:0x1FFF", "0x100~0x7FF"]
 address_claim = true
-
-[interface.can0.retention]
-limit = "500MB"
+retain = "500MB"
 
 [interface.can1]
 filters = ["0x200:0x7FF"]
@@ -144,20 +140,21 @@ filters = ["0x200:0x7FF"]
 The `[defaults]` section provides base values that all interfaces inherit from. Any option set in an
 `[interface.<name>]` section overrides the corresponding default.
 
-| Key             | Type              | Default          | Description                                                                             |
-| --------------- | ----------------- | ---------------- | --------------------------------------------------------------------------------------- |
-| `format`        | string            | `"candump-file"` | Output format: `"candump-file"`, `"candump-console"`, `"asc"`, `"pcap"`                 |
-| `compress`      | boolean           | `true`           | Enable zstd compression                                                                 |
-| `timestamp`     | string            | `"absolute"`     | Timestamp mode: `"absolute"`, `"delta"`, `"zero"`. Only applies to the candump formats  |
-| `directory`     | string            | required         | Directory to log in. Each interface logs to `<directory>/<interface>/`                  |
-| `batch_size`    | string or integer | `"auto"`         | io_uring batch size                                                                     |
-| `rcvbuf`        | integer           | system default   | Socket receive buffer size in bytes                                                     |
-| `address_claim` | boolean           | `false`          | Send J1939 address claim PGN request on rotation                                        |
-| `error_frames`  | boolean           | `true`           | Log error frames                                                                        |
-| `filters`       | array of strings  | `[]`             | candump-style filters                                                                   |
-| `flush_every`   | string            | `"5s"`           | Flush interval: a duration or a size. `"off"` disables automatic flush                  |
-| `sync_every`    | string            | `"5min"`         | Sync interval: a duration or a size. `"off"` disables periodic sync                     |
-| `rotate_every`  | string            | `"30min"`        | Rotation trigger: a size (e.g. `"100MB"`) or a duration (e.g. `"1h"`). `"off"` disables |
+| Key             | Type              | Default          | Description                                                                                  |
+| --------------- | ----------------- | ---------------- | -------------------------------------------------------------------------------------------- |
+| `format`        | string            | `"candump-file"` | Output format: `"candump-file"`, `"candump-console"`, `"asc"`, `"pcap"`                      |
+| `compress`      | boolean           | `true`           | Enable zstd compression                                                                      |
+| `timestamp`     | string            | `"absolute"`     | Timestamp mode: `"absolute"`, `"delta"`, `"zero"`. Only applies to the candump formats       |
+| `directory`     | string            | required         | Directory to log in. Each interface logs to `<directory>/<interface>/`                       |
+| `batch_size`    | string or integer | `"auto"`         | io_uring batch size                                                                          |
+| `rcvbuf`        | integer           | system default   | Socket receive buffer size in bytes                                                          |
+| `address_claim` | boolean           | `false`          | Send J1939 address claim PGN request on rotation                                             |
+| `error_frames`  | boolean           | `true`           | Log error frames                                                                             |
+| `filters`       | array of strings  | `[]`             | candump-style filters                                                                        |
+| `flush_every`   | string            | `"5s"`           | Flush interval: a duration or a size. `"off"` disables automatic flush                       |
+| `sync_every`    | string            | `"5min"`         | Sync interval: a duration or a size. `"off"` disables periodic sync                          |
+| `rotate_every`  | string            | `"30min"`        | Rotation trigger: a size (e.g. `"100MB"`) or a duration (e.g. `"1h"`). `"off"` disables      |
+| `retain`        | string            | `"1 GB"`         | Retention limit: a total size, an age, or a file count (e.g. `"10 files"`). `"off"` disables |
 
 ## Rotation
 
@@ -168,11 +165,7 @@ SIGHUP always triggers an immediate rotation regardless of the configured limit.
 
 ## Retention
 
-Configured under `[defaults.retention]` or `[interface.<name>.retention]`.
-
-| Key     | Type   | Default  | Description                                         |
-| ------- | ------ | -------- | --------------------------------------------------- |
-| `limit` | string | required | Retention limit per interface. Size (e.g. `"1GB"`). |
+Retention is configured with the `retain` key: a total directory size, a file age, or a file count.
 
 Retention is enforced per-interface. Each interface independently manages its own log files and
 stays within its own limit. If total disk usage across all interfaces must be bounded, the user
@@ -185,8 +178,8 @@ There is no global retention policy for the aggregate data used by all interface
 Each `[interface.<name>]` section configures a specific CAN interface. The interface name is the
 Linux network interface name (e.g. `can0`, `vcan0`).
 
-All keys from `[defaults]` can be overridden per-interface, plus the rotation and retention
-subsections. At least one `[interface.<name>]` section must be present.
+All keys from `[defaults]` can be overridden per-interface. At least one `[interface.<name>]`
+section must be present.
 
 # Filter syntax
 
