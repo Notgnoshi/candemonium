@@ -84,7 +84,7 @@ pub struct Cli {
 
     /// Rotate the log when it exceeds a size ("100MB") or an age ("30min"). "off" disables.
     #[arg(long, value_name = "LIMIT", requires = "log", default_value = "30 minutes", conflicts_with_all = ["output", "daemon"])]
-    pub rotation: Rotation,
+    pub rotate_every: Rotation,
 
     /// Log level for tracing output on stderr.
     #[arg(long, default_value = "INFO")]
@@ -190,10 +190,10 @@ struct RawStreamConfig {
     // [RawStreamConfig::default].
     directory: Option<PathBuf>,
     #[serde(deserialize_with = "deserialize_interval")]
-    flush_interval: Option<Duration>,
+    flush_every: Option<Duration>,
     #[serde(deserialize_with = "deserialize_interval")]
-    sync_interval: Option<Duration>,
-    rotation: Rotation,
+    sync_every: Option<Duration>,
+    rotate_every: Rotation,
 }
 
 impl Default for RawStreamConfig {
@@ -203,9 +203,9 @@ impl Default for RawStreamConfig {
             compress: true,
             timestamp: TimestampMode::Absolute,
             directory: None,
-            flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
-            sync_interval: Some(DEFAULT_SYNC_INTERVAL),
-            rotation: Rotation::Interval(Duration::from_secs(30 * 60)),
+            flush_every: Some(DEFAULT_FLUSH_INTERVAL),
+            sync_every: Some(DEFAULT_SYNC_INTERVAL),
+            rotate_every: Rotation::Interval(Duration::from_secs(30 * 60)),
         }
     }
 }
@@ -302,7 +302,7 @@ impl Config {
                 compress: cli.compress,
                 flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
                 sync_interval: Some(DEFAULT_SYNC_INTERVAL),
-                rotation: cli.rotation,
+                rotation: cli.rotate_every,
             })
             .collect();
 
@@ -378,9 +378,9 @@ impl Config {
                 format: settings.format,
                 timestamp: settings.timestamp,
                 compress: settings.compress,
-                flush_interval: settings.flush_interval,
-                sync_interval: settings.sync_interval,
-                rotation: settings.rotation,
+                flush_interval: settings.flush_every,
+                sync_interval: settings.sync_every,
+                rotation: settings.rotate_every,
             });
         }
 
@@ -405,16 +405,16 @@ mod tests {
             directory = "/var/log/can"
             compress = false
             timestamp = "delta"
-            sync_interval = "off"
-            rotation = "100MB"
+            sync_every = "off"
+            rotate_every = "100MB"
 
             [interface.can1]
 
             [interface.can0]
             compress = true
             format = "candump-console"
-            flush_interval = "250ms"
-            rotation = "off"
+            flush_every = "250ms"
+            rotate_every = "off"
         "#;
         let config = Config::from_toml(src).unwrap();
 
@@ -434,7 +434,7 @@ mod tests {
                     compress: true,
                     flush_interval: Some(Duration::from_millis(250)),
                     sync_interval: None,
-                    // Overrides the inherited size, exactly like `flush_interval = "off"` next door.
+                    // Overrides the inherited size, exactly like `flush_every = "off"` next door.
                     rotation: Rotation::Off,
                 },
                 StreamConfig {
@@ -456,34 +456,31 @@ mod tests {
 
     #[test]
     fn intervals_accept_durations_and_off() {
-        /// Resolve a config whose only interval is `flush_interval = <value>`.
-        fn flush_interval(value: &str) -> eyre::Result<Option<Duration>> {
+        /// Resolve a config whose only interval is `flush_every = <value>`.
+        fn flush_every(value: &str) -> eyre::Result<Option<Duration>> {
             let src = format!(
-                "[defaults]\ndirectory = \"/x\"\nflush_interval = {value:?}\n[interface.can0]\n"
+                "[defaults]\ndirectory = \"/x\"\nflush_every = {value:?}\n[interface.can0]\n"
             );
             Ok(Config::from_toml(&src)?.streams[0].flush_interval)
         }
 
-        assert_eq!(flush_interval("5s").unwrap(), Some(Duration::from_secs(5)));
+        assert_eq!(flush_every("5s").unwrap(), Some(Duration::from_secs(5)));
         assert_eq!(
-            flush_interval("500ms").unwrap(),
+            flush_every("500ms").unwrap(),
             Some(Duration::from_millis(500))
         );
+        assert_eq!(flush_every("5min").unwrap(), Some(Duration::from_secs(300)));
         assert_eq!(
-            flush_interval("5min").unwrap(),
-            Some(Duration::from_secs(300))
-        );
-        assert_eq!(
-            flush_interval("1min 30s").unwrap(),
+            flush_every("1min 30s").unwrap(),
             Some(Duration::from_secs(90))
         );
-        assert_eq!(flush_interval("off").unwrap(), None);
+        assert_eq!(flush_every("off").unwrap(), None);
 
-        let err = format!("{:#}", flush_interval("soon").unwrap_err());
+        let err = format!("{:#}", flush_every("soon").unwrap_err());
         assert!(err.contains("a duration like"), "got: {err}");
-        let err = format!("{:#}", flush_interval("-3s").unwrap_err());
+        let err = format!("{:#}", flush_every("-3s").unwrap_err());
         assert!(err.contains("must not be negative"), "got: {err}");
-        let err = format!("{:#}", flush_interval("64KB").unwrap_err());
+        let err = format!("{:#}", flush_every("64KB").unwrap_err());
         assert!(err.contains("not yet supported"), "got: {err}");
     }
 

@@ -123,9 +123,7 @@ batch_size = "auto"
 rcvbuf = 212992
 address_claim = false
 error_frames = true
-
-[defaults.rotation]
-limit = "100MB"
+rotate_every = "100MB"
 
 [defaults.retention]
 limit = "1GB"
@@ -146,29 +144,25 @@ filters = ["0x200:0x7FF"]
 The `[defaults]` section provides base values that all interfaces inherit from. Any option set in an
 `[interface.<name>]` section overrides the corresponding default.
 
-| Key              | Type              | Default          | Description                                                                            |
-| ---------------- | ----------------- | ---------------- | -------------------------------------------------------------------------------------- |
-| `format`         | string            | `"candump-file"` | Output format: `"candump-file"`, `"candump-console"`, `"asc"`, `"pcap"`                |
-| `compress`       | boolean           | `true`           | Enable zstd compression                                                                |
-| `timestamp`      | string            | `"absolute"`     | Timestamp mode: `"absolute"`, `"delta"`, `"zero"`. Only applies to the candump formats |
-| `directory`      | string            | required         | Directory to log in. Each interface logs to `<directory>/<interface>/`                 |
-| `batch_size`     | string or integer | `"auto"`         | io_uring batch size                                                                    |
-| `rcvbuf`         | integer           | system default   | Socket receive buffer size in bytes                                                    |
-| `address_claim`  | boolean           | `false`          | Send J1939 address claim PGN request on rotation                                       |
-| `error_frames`   | boolean           | `true`           | Log error frames                                                                       |
-| `filters`        | array of strings  | `[]`             | candump-style filters                                                                  |
-| `flush_interval` | string            | `"5s"`           | Upper bound between `flush` calls. `"off"` disables time-based flush                   |
-| `sync_interval`  | string            | `"5min"`         | Upper bound between `sync` calls. `"off"` disables periodic sync                       |
+| Key             | Type              | Default          | Description                                                                             |
+| --------------- | ----------------- | ---------------- | --------------------------------------------------------------------------------------- |
+| `format`        | string            | `"candump-file"` | Output format: `"candump-file"`, `"candump-console"`, `"asc"`, `"pcap"`                 |
+| `compress`      | boolean           | `true`           | Enable zstd compression                                                                 |
+| `timestamp`     | string            | `"absolute"`     | Timestamp mode: `"absolute"`, `"delta"`, `"zero"`. Only applies to the candump formats  |
+| `directory`     | string            | required         | Directory to log in. Each interface logs to `<directory>/<interface>/`                  |
+| `batch_size`    | string or integer | `"auto"`         | io_uring batch size                                                                     |
+| `rcvbuf`        | integer           | system default   | Socket receive buffer size in bytes                                                     |
+| `address_claim` | boolean           | `false`          | Send J1939 address claim PGN request on rotation                                        |
+| `error_frames`  | boolean           | `true`           | Log error frames                                                                        |
+| `filters`       | array of strings  | `[]`             | candump-style filters                                                                   |
+| `flush_every`   | string            | `"5s"`           | Upper bound between `flush` calls. `"off"` disables time-based flush                    |
+| `sync_every`    | string            | `"5min"`         | Upper bound between `sync` calls. `"off"` disables periodic sync                        |
+| `rotate_every`  | string            | `"30min"`        | Rotation trigger: a size (e.g. `"100MB"`) or a duration (e.g. `"1h"`). `"off"` disables |
 
 ## Rotation
 
-Configured under `[defaults.rotation]` or `[interface.<name>.rotation]`.
-
-| Key     | Type   | Default  | Description                                                        |
-| ------- | ------ | -------- | ------------------------------------------------------------------ |
-| `limit` | string | required | Rotation trigger. Size (e.g. `"100MB"`) or duration (e.g. `"1h"`). |
-
-Size and duration are mutually exclusive: the limit is either a size or a duration, not both.
+Rotation is configured with the `rotate_every` key. The limit is either a size or a duration, not
+both.
 
 SIGHUP always triggers an immediate rotation regardless of the configured limit.
 

@@ -39,21 +39,22 @@ compress = true
 
 Each of the `[defaults]` and `[interface.<name>]` tables support the following keys:
 
-| Key              | Default          | Description                                                                |
-| ---------------- | ---------------- | -------------------------------------------------------------------------- |
-| `directory`      | required         | Directory to log in. Each interface will log to `<directory>/<interface>/` |
-| `format`         | `"candump-file"` | One of: `"candump-file"` or `"candump-console"`                            |
-| `compress`       | `true`           | Compress the log files with zstd                                           |
-| `timestamp`      | `"absolute"`     | Timestamp mode: `"absolute"`, `"delta"`, or `"zero"`                       |
-| `flush_interval` | `"5s"`           | Upper bound between flushes. `"off"` disables periodic flushing            |
-| `sync_interval`  | `"5min"`         | Upper bound between fsyncs. `"off"` disables periodic syncing              |
-| `rotation`       | `"30min"`        | Rotate the log once it exceeds a size or an age. `"off"` disables rotation |
+| Key            | Default          | Description                                                                |
+| -------------- | ---------------- | -------------------------------------------------------------------------- |
+| `directory`    | required         | Directory to log in. Each interface will log to `<directory>/<interface>/` |
+| `format`       | `"candump-file"` | One of: `"candump-file"` or `"candump-console"`                            |
+| `compress`     | `true`           | Compress the log files with zstd                                           |
+| `timestamp`    | `"absolute"`     | Timestamp mode: `"absolute"`, `"delta"`, or `"zero"`                       |
+| `flush_every`  | `"5s"`           | Upper bound between flushes. `"off"` disables periodic flushing            |
+| `sync_every`   | `"5min"`         | Upper bound between fsyncs. `"off"` disables periodic syncing              |
+| `rotate_every` | `"30min"`        | Rotate the log once it exceeds a size or an age. `"off"` disables rotation |
 
-The interval strings are parsed using
-[jiff::SignedDuration](https://docs.rs/jiff/latest/jiff/struct.SignedDuration.html).
+Durations are parsed using
+[jiff's friendly format](https://docs.rs/jiff/latest/jiff/fmt/friendly/index.html). Days and weeks
+are also accepted.
 
-The `rotation` parameter can accept time intervals or size intervals. Examples: `512B`, `100 MiB`,
-`1 gb`, `1m` (1 minute), `30 minutes`, `off`.
+The `rotate_every` parameter can accept durations or sizes. Examples: `512B`, `100 MiB`, `1 gb`,
+`1m` (1 minute), `30 minutes`, `1 day`, `off`.
 
 ## Output files
 
