@@ -187,6 +187,29 @@ pub fn enable_drop_count(fd: BorrowedFd<'_>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Enable receipt of this socket's own sent frames.
+pub fn enable_recv_own_msgs(fd: BorrowedFd<'_>) -> std::io::Result<()> {
+    let val: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_CAN_RAW,
+            libc::CAN_RAW_RECV_OWN_MSGS,
+            std::ptr::from_ref(&val).cast::<libc::c_void>(),
+            std::mem::size_of_val(&val) as u32,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The J1939 PGN Request for Address Claim
+pub fn address_claim_pgn_request() -> LinuxCanFrame {
+    LinuxCanFrame::new(0x18EAFFFE | libc::CAN_EFF_FLAG, &[0x00, 0xEE, 0x00])
+}
+
 /// Send a single CAN frame on the socket.
 pub fn send_frame(fd: BorrowedFd<'_>, frame: &LinuxCanFrame) -> std::io::Result<()> {
     let written = unsafe {
