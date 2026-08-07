@@ -290,12 +290,8 @@ impl Sink {
         }
     }
 
-    /// Check the time-based flush and sync triggers
-    ///
-    /// Should be called periodically
-    pub fn tick(&mut self) -> eyre::Result<()> {
-        let now = Instant::now();
-
+    /// Check the time-based flush, sync, and rotation triggers against `now`.
+    pub fn tick(&mut self, now: Instant) -> eyre::Result<()> {
         if self.should_rotate(now) {
             // Rotation already flushes and syncs, and leaves the sink in SinkState::Pending
             return self.rotate();
@@ -567,7 +563,7 @@ mod tests {
     fn tick_flush_sync_are_noops_while_pending() {
         let dir = TempDir::new().unwrap();
         let mut sink = sink_in(&dir, None);
-        sink.tick().unwrap();
+        sink.tick(Instant::now()).unwrap();
         sink.flush().unwrap();
         sink.sync().unwrap();
         assert!(entries(&dir).is_empty());
@@ -689,15 +685,23 @@ mod tests {
     #[test]
     fn duration_rotation_fires_from_tick() {
         let dir = TempDir::new().unwrap();
-        let mut sink = rotating_sink_in(&dir, Interval::Every(Duration::from_millis(1)));
+        // An interval that's unlikely to get hit during the test
+        let interval = Duration::from_secs(3600);
+        let mut sink = rotating_sink_in(&dir, Interval::Every(interval));
 
         sink.write(b"PAYLOAD", ts(1732117385)).unwrap();
-        assert!(matches!(sink.state, SinkState::Active { .. }));
+        let SinkState::Active { opened_at, .. } = &sink.state else {
+            panic!("the first write must activate the sink");
+        };
+        let opened_at = *opened_at;
 
-        // TODO: Pass Instant::now() into tick()
-        std::thread::sleep(Duration::from_millis(5));
-        sink.tick().unwrap();
+        sink.tick(opened_at + interval / 2).unwrap();
+        assert!(
+            matches!(sink.state, SinkState::Active { .. }),
+            "halfway through the interval must not rotate"
+        );
 
+        sink.tick(opened_at + interval).unwrap();
         assert!(matches!(sink.state, SinkState::Pending { .. }));
         // contents() asserts a single file is present in the directory
         assert_eq!(contents(&dir), b"PAYLOAD");

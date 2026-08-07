@@ -75,7 +75,8 @@ impl Pipeline {
 
     /// Run each sink's periodic flush and sync checks.
     pub fn tick(&mut self) -> eyre::Result<()> {
-        self.for_each_sink(Sink::tick)
+        let now = std::time::Instant::now();
+        self.for_each_sink(|sink| sink.tick(now))
     }
 
     /// Flush every sink.
