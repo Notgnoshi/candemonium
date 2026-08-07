@@ -22,6 +22,10 @@ focus on the user impact** rather than the actual changes made.
 
 ## Fixed
 
+# candemonium - 0.1.0 - (2026-08-07)
+
+First release of candemonium with an MVP release of the `candumpr` logging tool.
+
 # candemonium - 0.1.0-rc1 - (2026-03-29)
 
 Added very basic `candumpr` implementation using io_uring multishot to read from multiple sockets in

@@ -150,7 +150,7 @@ checksum = "7354288c522e7e980fafd2075d63d1285794c3a6a16cdd492f189ea406e5f18b"
 
 [[package]]
 name = "candumpr"
-version = "0.1.0-rc1"
+version = "0.1.0"
 dependencies = [
  "bytesize",
  "clap",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "cangenr"
-version = "0.1.0-rc1"
+version = "0.1.0"
 
 [[package]]
 name = "cc"
@@ -1260,7 +1260,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcan-fixture"
-version = "0.1.0-rc1"
+version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "ctor",
