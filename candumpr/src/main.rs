@@ -177,15 +177,21 @@ fn main() -> ExitCode {
 
     let recv_names = names.clone();
     let recv_flags = claim_flags.clone();
-    let recv_handle = std::thread::spawn(move || -> eyre::Result<u64> {
-        let mut recv = Receiver::new(sockets)?;
-        let total = recv.run(&SIGNAL_STOP, &recv_names, &recv_flags, &full_tx, &empty_rx)?;
-        Ok(total)
-    });
+    let recv_handle = std::thread::Builder::new()
+        .name("candumpr-recv".into())
+        .spawn(move || -> eyre::Result<u64> {
+            let mut recv = Receiver::new(sockets)?;
+            let total = recv.run(&SIGNAL_STOP, &recv_names, &recv_flags, &full_tx, &empty_rx)?;
+            Ok(total)
+        })
+        .expect("failed to spawn recv thread");
 
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<LinkEvent>();
     let nl_names = names.clone();
-    let nl_handle = std::thread::spawn(move || netlink::run(&SIGNAL_STOP, &nl_names, &event_tx));
+    let nl_handle = std::thread::Builder::new()
+        .name("candumpr-net".into())
+        .spawn(move || netlink::run(&SIGNAL_STOP, &nl_names, &event_tx))
+        .expect("failed to spawn netlink thread");
 
     // Last observed link state per sock_id, so we log only edges.
     let mut link_up: Vec<Option<bool>> = vec![None; names.len()];
