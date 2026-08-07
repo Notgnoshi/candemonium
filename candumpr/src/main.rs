@@ -127,10 +127,11 @@ fn main() -> ExitCode {
     // 4. et al.
     //
     // all follow the same ordering, and are all indexed by CanFrame::sock_id
-    let names = config.interfaces.clone();
-    let sockets: Vec<_> = match names
+    let names: Vec<String> = config.interfaces.iter().map(|i| i.name.clone()).collect();
+    let sockets: Vec<_> = match config
+        .interfaces
         .iter()
-        .map(|name| can::open_can_raw(name))
+        .map(|i| can::open_can_raw(&i.name))
         .collect::<std::io::Result<_>>()
     {
         Ok(sockets) => sockets,

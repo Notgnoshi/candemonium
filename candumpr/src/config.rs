@@ -86,9 +86,20 @@ pub struct Cli {
     #[arg(long, value_name = "LIMIT", requires = "log", default_value = "30 minutes", conflicts_with_all = ["output", "daemon"])]
     pub rotate_every: Interval,
 
+    /// Do not broadcast a J1939 Address Claim PGN request when a log file is opened.
+    #[arg(long, conflicts_with = "daemon")]
+    pub no_request_address_claims: bool,
+
     /// Log level for tracing output on stderr.
     #[arg(long, default_value = "INFO")]
     pub log_level: tracing::Level,
+}
+
+/// Identity and settings for one logged interface.
+#[derive(Debug, PartialEq, Eq)]
+pub struct InterfaceConfig {
+    pub name: String,
+    pub request_address_claims: bool,
 }
 
 /// Logging configuration parsed from CLI or a TOML config file
@@ -96,9 +107,10 @@ pub struct Cli {
 pub struct Config {
     /// Interfaces to log
     ///
-    /// NOTE: The order of interfaces in this vector needs to be stable. It's used in internal
-    /// bookkeeping to associate sockets with sinks.
-    pub interfaces: Vec<String>,
+    /// NOTE: Position in this vector is the sock_id used for internal bookkeeping everywhere
+    /// else: it indexes the sockets, the formatters' name tables, the per-interface state in the
+    /// main loop, and associates sockets with sinks.
+    pub interfaces: Vec<InterfaceConfig>,
     /// Either exactly one interleaved stream, or one stream for each interface.
     pub streams: Vec<StreamConfig>,
     /// Whether recoverable [Sink](crate::sink::Sink) activation failures are retried or are fatal.
@@ -220,6 +232,7 @@ struct RawStreamConfig {
     rotate_every: Interval,
     #[serde(deserialize_with = "deserialize_retention")]
     retain: RetentionLimit,
+    request_address_claims: bool,
 }
 
 impl Default for RawStreamConfig {
@@ -233,6 +246,7 @@ impl Default for RawStreamConfig {
             sync_every: Interval::Every(DEFAULT_SYNC_INTERVAL),
             rotate_every: Interval::Every(Duration::from_secs(30 * 60)),
             retain: RetentionLimit::Size(1_000_000_000),
+            request_address_claims: true,
         }
     }
 }
@@ -336,8 +350,17 @@ impl Config {
             })
             .collect();
 
+        let interfaces = cli
+            .interfaces
+            .iter()
+            .map(|name| InterfaceConfig {
+                name: name.clone(),
+                request_address_claims: !cli.no_request_address_claims,
+            })
+            .collect();
+
         Ok(Config {
-            interfaces: cli.interfaces.clone(),
+            interfaces,
             streams,
             retry_activation_failures: false,
         })
@@ -360,11 +383,11 @@ impl Config {
             tracing::warn!("unknown configuration key: {key:?}");
         }
 
-        let mut interfaces: Vec<String> = raw.interface.keys().cloned().collect();
-        interfaces.sort_unstable();
+        let mut names: Vec<String> = raw.interface.keys().cloned().collect();
+        names.sort_unstable();
         drop(raw); // just parsed for type-checking and valid TOML syntax. Overlaying is all done on the toml::Table level below.
         eyre::ensure!(
-            !interfaces.is_empty(),
+            !names.is_empty(),
             "no [interface.<name>] sections; at least one is required"
         );
 
@@ -382,8 +405,9 @@ impl Config {
             .cloned()
             .unwrap_or_default();
 
-        let mut streams = Vec::with_capacity(interfaces.len());
-        for interface in &interfaces {
+        let mut interfaces = Vec::with_capacity(names.len());
+        let mut streams = Vec::with_capacity(names.len());
+        for interface in &names {
             // Non-table sections cannot reach here; pass 1 fails on them first.
             let section = sections
                 .get(interface)
@@ -414,6 +438,10 @@ impl Config {
                 }
                 _ => {}
             }
+            interfaces.push(InterfaceConfig {
+                name: interface.clone(),
+                request_address_claims: settings.request_address_claims,
+            });
             streams.push(StreamConfig {
                 output: Output::Template {
                     dir: directory.join(interface),
@@ -465,7 +493,19 @@ mod tests {
         "#;
         let config = Config::from_toml(src).unwrap();
 
-        assert_eq!(config.interfaces, ["can0", "can1"]);
+        assert_eq!(
+            config.interfaces,
+            [
+                InterfaceConfig {
+                    name: "can0".to_string(),
+                    request_address_claims: true,
+                },
+                InterfaceConfig {
+                    name: "can1".to_string(),
+                    request_address_claims: true,
+                },
+            ]
+        );
         assert!(config.retry_activation_failures);
         assert_eq!(
             config.streams,
