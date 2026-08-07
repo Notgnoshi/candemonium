@@ -1,5 +1,7 @@
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::{Interval, RetentionLimit};
@@ -99,6 +101,8 @@ pub struct Sink {
     config: SinkConfig,
     pub(crate) state: SinkState,
     retention: Option<RetentionPolicy>,
+    /// One flag for each interface that this Sink handles traffic for.
+    address_claim_flags: Vec<Arc<AtomicBool>>,
 }
 
 /// Minimum time between activation attempts after a failed activation.
@@ -140,6 +144,7 @@ impl Sink {
             config,
             state: SinkState::Pending { last_attempt: None },
             retention,
+            address_claim_flags: Vec::new(),
         }
     }
 
@@ -221,11 +226,15 @@ impl Sink {
         else {
             unreachable!("state must be Active after the Pending branch above");
         };
-        if just_activated
-            && let Some(policy) = &mut self.retention
-            && let Some(path) = writer.path()
-        {
-            policy.activated(path)?;
+        if just_activated {
+            if let Some(policy) = &mut self.retention
+                && let Some(path) = writer.path()
+            {
+                policy.activated(path)?;
+            }
+            for flag in &self.address_claim_flags {
+                flag.store(true, Ordering::Relaxed);
+            }
         }
         writer.write_all(bytes)?;
         wrote += bytes.len();
@@ -601,6 +610,38 @@ mod tests {
         assert_eq!(std::fs::read(&paths[0]).unwrap(), b"HDRFIRST");
         // The header is rewritten at the top of the rotated file.
         assert_eq!(std::fs::read(&paths[1]).unwrap(), b"HDRSECOND");
+    }
+
+    #[test]
+    fn activation_trips_claim_flags() {
+        let dir = TempDir::new().unwrap();
+        let mut sink = sink_in(&dir, None);
+        let flag = Arc::new(AtomicBool::new(false));
+        sink.address_claim_flags = vec![flag.clone()];
+
+        sink.write(b"FIRST", ts(1732117385)).unwrap();
+        assert!(
+            flag.swap(false, Ordering::Relaxed),
+            "the first write activates and must trip the flag"
+        );
+
+        sink.write(b"MORE", ts(1732117385)).unwrap();
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a write to an already-active sink must not trip the flag"
+        );
+
+        sink.rotate().unwrap();
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "rotation alone must not trip the flag; the next activation does"
+        );
+
+        sink.write(b"SECOND", ts(1732117385)).unwrap();
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "the write after rotation re-activates and must trip the flag"
+        );
     }
 
     fn rotating_sink_in(dir: &TempDir, rotation: Interval) -> Sink {
