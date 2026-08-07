@@ -151,7 +151,7 @@ fn logs_each_interface_to_its_own_file() {
     let dir = tempfile::TempDir::new().unwrap();
 
     let child = tool!("candumpr")
-        .args(["-l", "--timestamp", "zero"])
+        .args(["-l", "--timestamp", "zero", "--no-request-address-claims"])
         .arg(iface1)
         .arg(iface2)
         .current_dir(dir.path())

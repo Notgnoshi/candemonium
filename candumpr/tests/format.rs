@@ -41,8 +41,13 @@ fn run_and_log_one_frame(extra_args: &[&str]) -> (String, Vec<String>) {
 #[test]
 #[cfg_attr(feature = "ci", ignore = "requires vcan")]
 fn console_format_with_zero_timestamp_is_deterministic() {
-    let (iface, lines) =
-        run_and_log_one_frame(&["--format", "candump-console", "--timestamp", "zero"]);
+    let (iface, lines) = run_and_log_one_frame(&[
+        "--format",
+        "candump-console",
+        "--timestamp",
+        "zero",
+        "--no-request-address-claims",
+    ]);
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0], format!("(000.000000) {iface} 123 [1] AB"));
 }

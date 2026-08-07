@@ -1,5 +1,6 @@
 use std::alloc::Layout;
 use std::os::unix::io::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use io_uring::types::BufRingEntry;
@@ -50,11 +51,12 @@ impl Receiver {
     /// Create a new receiver from non-blocking sockets (from
     /// [open_can_raw](crate::can::open_can_raw)).
     ///
-    /// Enables hardware timestamping and drop count reporting on each socket.
+    /// Enables hardware timestamping, drop count reporting, and own-message echo on each socket.
     pub fn new(sockets: Vec<OwnedFd>) -> std::io::Result<Self> {
         for sock in &sockets {
             can::enable_timestamps(sock.as_fd())?;
             can::enable_drop_count(sock.as_fd())?;
+            can::enable_recv_own_msgs(sock.as_fd())?;
         }
 
         let sq_size = (sockets.len() as u32).next_power_of_two().max(4);
@@ -123,6 +125,8 @@ impl Receiver {
     pub fn run(
         &mut self,
         stop: &AtomicBool,
+        names: &[String],
+        claim_flags: &[Arc<AtomicBool>],
         full_tx: &crossbeam_channel::Sender<Vec<CanFrame>>,
         empty_rx: &crossbeam_channel::Receiver<Vec<CanFrame>>,
     ) -> std::io::Result<u64> {
@@ -223,6 +227,25 @@ impl Receiver {
             if !batch.is_empty() && full_tx.send(batch).is_err() {
                 // Channel disconnected; writer thread is gone.
                 return Ok(total);
+            }
+
+            // A tripped flag means a Sink just opened a log file covering that interface, so we
+            // should send an address claim PGN request so that control functions are identifiable
+            // when parsing the logged CAN data.
+            for (idx, flag) in claim_flags.iter().enumerate() {
+                if flag.swap(false, Ordering::Relaxed) {
+                    let frame = can::address_claim_pgn_request();
+                    match can::send_frame(self.sockets[idx].as_fd(), &frame) {
+                        Ok(()) => {
+                            tracing::debug!(interface = %names[idx], "sent address claim PGN request")
+                        }
+                        Err(e) => tracing::error!(
+                            interface = %names[idx],
+                            error = %e,
+                            "failed to send address claim request"
+                        ),
+                    }
+                }
             }
         }
 
@@ -360,7 +383,7 @@ mod tests {
         // Receiver must be created on the same thread that calls run() due to SINGLE_ISSUER.
         let handle = std::thread::spawn(move || {
             let mut recv = Receiver::new(rx_sockets).unwrap();
-            recv.run(&STOP, &full_tx, &empty_rx)
+            recv.run(&STOP, &[], &[], &full_tx, &empty_rx)
         });
 
         let mut count = 0u64;
