@@ -23,6 +23,7 @@ fn canutils_stdout_output() {
     let iface1 = &vcans.names()[1];
 
     let child = tool!("candumpr")
+        .arg("--no-request-address-claims")
         .arg(iface0)
         .arg(iface1)
         .spawn_piped()

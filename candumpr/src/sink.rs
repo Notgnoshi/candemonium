@@ -148,6 +148,10 @@ impl Sink {
         }
     }
 
+    pub fn set_address_claim_flags(&mut self, flags: Vec<Arc<AtomicBool>>) {
+        self.address_claim_flags = flags;
+    }
+
     /// Write `bytes` to the writer, activating the sink on the first call.
     ///
     /// The bytes are expected to evenly divide CAN frames. That is, no partially formatted frames

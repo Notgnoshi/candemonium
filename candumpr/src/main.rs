@@ -1,5 +1,6 @@
 use std::os::unix::io::AsFd;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -124,7 +125,8 @@ fn main() -> ExitCode {
     // 1. config.interfaces
     // 2. sockets
     // 3. Pipeline::sinks / bufs
-    // 4. et al.
+    // 4. claim_flags
+    // 5. et al.
     //
     // all follow the same ordering, and are all indexed by CanFrame::sock_id
     let names: Vec<String> = config.interfaces.iter().map(|i| i.name.clone()).collect();
@@ -167,9 +169,17 @@ fn main() -> ExitCode {
         }
     }
 
+    let claim_flags: Vec<Arc<AtomicBool>> = config
+        .interfaces
+        .iter()
+        .map(|_| Arc::new(AtomicBool::new(false)))
+        .collect();
+
+    let recv_names = names.clone();
+    let recv_flags = claim_flags.clone();
     let recv_handle = std::thread::spawn(move || -> eyre::Result<u64> {
         let mut recv = Receiver::new(sockets)?;
-        let total = recv.run(&SIGNAL_STOP, &full_tx, &empty_rx)?;
+        let total = recv.run(&SIGNAL_STOP, &recv_names, &recv_flags, &full_tx, &empty_rx)?;
         Ok(total)
     });
 
@@ -183,10 +193,13 @@ fn main() -> ExitCode {
     let mut bus_state: Vec<BusState> = vec![BusState::default(); names.len()];
 
     let retry_activation_failures = config.retry_activation_failures;
+    // A single stream covers every interface, otherwise stream i covers interface i
+    let single = config.streams.len() == 1;
     let streams = config
         .streams
         .into_iter()
-        .map(|stream| {
+        .enumerate()
+        .map(|(stream_idx, stream)| {
             let formatter: Box<dyn Formatter> = match stream.format {
                 Format::CandumpFile => {
                     Box::new(CanutilsFileFormatter::new(names.clone(), stream.timestamp))
@@ -196,15 +209,25 @@ fn main() -> ExitCode {
                     stream.timestamp,
                 )),
             };
-            let mut sink = SinkConfig::new(stream.output);
-            sink.header = formatter.header().map(|h| h.to_vec());
-            sink.compress = stream.compress;
-            sink.flush_every = stream.flush_every;
-            sink.sync_every = stream.sync_every;
-            sink.rotation = stream.rotation;
-            sink.retention = stream.retention;
-            sink.retry_activation_failures = retry_activation_failures;
-            (formatter, Sink::new(sink))
+            let mut sink_config = SinkConfig::new(stream.output);
+            sink_config.header = formatter.header().map(|h| h.to_vec());
+            sink_config.compress = stream.compress;
+            sink_config.flush_every = stream.flush_every;
+            sink_config.sync_every = stream.sync_every;
+            sink_config.rotation = stream.rotation;
+            sink_config.retention = stream.retention;
+            sink_config.retry_activation_failures = retry_activation_failures;
+            let mut sink = Sink::new(sink_config);
+            sink.set_address_claim_flags(
+                config
+                    .interfaces
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, ic)| (single || *i == stream_idx) && ic.request_address_claims)
+                    .map(|(i, _)| claim_flags[i].clone())
+                    .collect(),
+            );
+            (formatter, sink)
         })
         .collect();
     let mut pipeline = Pipeline::new(streams);
