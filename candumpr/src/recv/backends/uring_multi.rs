@@ -25,7 +25,7 @@ use crate::recv::{FrameMeta, Timestamp};
 
 /// Number of provided buffers (and CQ entries) in the ring. The CQ is sized to match so the
 /// kernel can post one completion per buffer without overflow. Must be a power of two.
-const FRAMEBUF_COUNT: u16 = 256;
+const FRAMEBUF_COUNT: u16 = 512;
 const _: () = assert!(FRAMEBUF_COUNT.is_power_of_two());
 
 /// Buffer group ID for the provided buffer ring. io_uring supports multiple buffer rings
@@ -35,7 +35,7 @@ const BGID: u16 = 0;
 /// Number of CQEs to wait for before waking. Reduces wakeup frequency at the cost of added recv
 /// latency. The 100ms timeout on submit_with_args ensures we still wake promptly for shutdown or
 /// when traffic is sparse.
-const BATCH_SIZE: usize = 4;
+const BATCH_SIZE: usize = 32;
 
 /// Size of the `io_uring_recvmsg_out` header the kernel writes at the start of each provided
 /// buffer. This is a stable kernel ABI (4 x u32).
